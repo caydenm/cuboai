@@ -24,6 +24,8 @@ def load_library() -> CDLL:
     glibc_lib_path = os.path.join(base_dir, "..", "libIOTCAPIs_ALL.so")
     alpine_lib_path = os.path.join(base_dir, "..", "libIOTCAPIs_ALL_alpine.so")
     gcompat_path = os.path.join(base_dir, "..", "libgcompat.so.0")
+    ucontext_path = os.path.join(base_dir, "..", "libucontext.so.1")
+    obstack_path = os.path.join(base_dir, "..", "libobstack.so.1")
     
     global_paths = [
         "/usr/local/lib/libIOTCAPIs_ALL.so",
@@ -45,6 +47,12 @@ def load_library() -> CDLL:
     if os.path.exists(gcompat_path) and os.path.exists(alpine_lib_path):
         _LOGGER.debug(f"Attempting natively side-loaded gcompat shim from {gcompat_path}")
         try:
+            # Pre-load gcompat dependencies
+            if os.path.exists(ucontext_path):
+                ctypes.CDLL(ucontext_path, mode=ctypes.RTLD_GLOBAL)
+            if os.path.exists(obstack_path):
+                ctypes.CDLL(obstack_path, mode=ctypes.RTLD_GLOBAL)
+                
             # Pre-load gcompat into global symbol space
             ctypes.CDLL(gcompat_path, mode=ctypes.RTLD_GLOBAL)
             _LOGGER.debug(f"Successfully pre-loaded gcompat shim from {gcompat_path}")
