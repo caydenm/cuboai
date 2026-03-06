@@ -20,9 +20,7 @@ class TutkError(Exception):
 
 def load_library() -> CDLL:
     paths = [
-        # Alpine/HAOS specific library first
-        os.path.join(os.path.dirname(__file__), "..", "libIOTCAPIs_ALL_alpine.so"),
-        # Check in the component directory for standard glibc library
+        # Check in the component directory
         os.path.join(os.path.dirname(__file__), "..", "libIOTCAPIs_ALL.so"),
         # Global paths
         "/usr/local/lib/libIOTCAPIs_ALL.so",
@@ -31,11 +29,7 @@ def load_library() -> CDLL:
     for path in paths:
         if os.path.exists(path):
             _LOGGER.debug(f"Loading TUTK library from: {path}")
-            try:
-                return ctypes.cdll.LoadLibrary(path)
-            except OSError as e:
-                _LOGGER.error(f"Failed to load TUTK library {path}. This usually means your system is missing glibc/libc6-compat (common on Alpine/Home Assistant OS). Error: {e}")
-                raise TutkError(f"Library load failed: {e}. If on Home Assistant OS/Alpine, please install libc6-compat or gcompat.")
+            return ctypes.cdll.LoadLibrary(path)
     
     raise TutkError("Could not find libIOTCAPIs_ALL.so. Make sure it is compiled for x86_64/aarch64 and placed in the custom_components/cuboai folder.")
 

@@ -12,15 +12,6 @@ async def async_setup_entry(hass, entry, async_add_entities):
     """Set up the CuboAI light platform."""
     cameras = entry.data.get("cameras", [])
     
-    tutk_supported = True
-    try:
-        from .api.tutk import load_library
-        # Attempt to load the library once before creating entities
-        load_library()
-    except Exception as e:
-        _LOGGER.error("Cannot enable Nightlight feature due to TUTK library error (Missing libc6-compat?): %s", e)
-        tutk_supported = False
-        
     entities = []
     for camera in cameras:
         uid = camera.get("device_id")
@@ -30,18 +21,15 @@ async def async_setup_entry(hass, entry, async_add_entities):
         baby_name = camera.get("baby_name", "Unknown")
         
         # P2P requires the admin credentials extracted from the cloud API
-        if tutk_supported and uid and user and pwd and license_id:
+        if uid and user and pwd and license_id:
             entities.append(CuboNightLight(hass, baby_name, uid, license_id, user, pwd))
-        elif not tutk_supported:
-            _LOGGER.warning("Skipping nightlight for %s because TUTK library failed to load.", baby_name)
         else:
             _LOGGER.warning(
                 "Skipping nightlight for %s because admin credentials or license_id are missing. "
                 "Please re-authenticate the integration.", baby_name
             )
 
-    if entities:
-        async_add_entities(entities, update_before_add=True)
+    async_add_entities(entities, update_before_add=True)
 
 class CuboNightLight(LightEntity):
     """Representation of a CuboAI Night Light."""
@@ -59,7 +47,7 @@ class CuboNightLight(LightEntity):
         self._license_id = license_id
         self._dev_admin_id = dev_admin_id
         self._dev_admin_pwd = dev_admin_pwd
-        self._is_on: bool | None = None
+        self._is_on = None
         self._attr_unique_id = f"cuboai_nightlight_{uid}"
 
     @property
@@ -73,7 +61,7 @@ class CuboNightLight(LightEntity):
         }
 
     @property
-    def is_on(self) -> bool | None:
+    def is_on(self) -> bool:
         """Return true if light is on."""
         return self._is_on
 
