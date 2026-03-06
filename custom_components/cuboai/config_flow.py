@@ -7,14 +7,7 @@ from homeassistant import config_entries
 from .api import cuboai_functions as api
 from .const import DOMAIN
 
-# Dedicated file logger for CuboAI
-file_handler = logging.FileHandler("/config/cuboai_auth.log")
-file_handler.setLevel(logging.DEBUG)
-formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-file_handler.setFormatter(formatter)
 _LOGGER = logging.getLogger(__name__)
-_LOGGER.addHandler(file_handler)
-_LOGGER.setLevel(logging.DEBUG)
 
 AUTH_SCHEMA = vol.Schema({vol.Required("username"): str, vol.Required("password"): str})
 
