@@ -20,25 +20,18 @@ class TutkError(Exception):
 
 def load_library() -> CDLL:
     paths = [
-        # Alpine/HAOS specific library first
-        os.path.join(os.path.dirname(__file__), "..", "libIOTCAPIs_ALL_alpine.so"),
-        # Check in the component directory for standard glibc library
+        # Check in the component directory
         os.path.join(os.path.dirname(__file__), "..", "libIOTCAPIs_ALL.so"),
         # Global paths
         "/usr/local/lib/libIOTCAPIs_ALL.so",
         "/usr/lib/libIOTCAPIs_ALL.so",
     ]
-    last_error = None
     for path in paths:
         if os.path.exists(path):
             _LOGGER.debug(f"Loading TUTK library from: {path}")
-            try:
-                return ctypes.cdll.LoadLibrary(path)
-            except OSError as e:
-                _LOGGER.warning(f"Failed to load TUTK library {path}. Trying next path... Error: {e}")
-                last_error = e
+            return ctypes.cdll.LoadLibrary(path)
     
-    raise TutkError(f"Could not load any libIOTCAPIs shared object. Last error: {last_error}. Ensure your system has the required C libraries (glibc or musl).")
+    raise TutkError("Could not find libIOTCAPIs_ALL.so. Make sure it is compiled for x86_64/aarch64 and placed in the custom_components/cuboai folder.")
 
 class TutkClient:
     def __init__(self, uid: str, license_id: str, admin_id: str, admin_pwd: str, region: int = 0):
