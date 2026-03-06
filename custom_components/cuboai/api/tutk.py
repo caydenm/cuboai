@@ -19,41 +19,52 @@ class TutkError(Exception):
     pass
 
 def load_library() -> CDLL:
-    paths = []
+    base_dir = os.path.dirname(__file__)
     
-    # Check if we are running on Alpine Linux (HAOS typically uses Alpine)
-    if os.path.exists("/etc/alpine-release"):
-        _LOGGER.debug("Alpine Linux detected. Configuring native gcompat shim...")
-        gcompat_path = os.path.join(os.path.dirname(__file__), "..", "libgcompat.so.0")
-        alpine_lib_path = os.path.join(os.path.dirname(__file__), "..", "libIOTCAPIs_ALL_alpine.so")
-        
-        if os.path.exists(gcompat_path) and os.path.exists(alpine_lib_path):
-            paths.append(alpine_lib_path)
-            # Pre-load the glibc compatibility shim into the global symbol space 
-            # so the dynamic linker finds it when evaluating libIOTCAPIs
-            try:
-                ctypes.CDLL(gcompat_path, mode=ctypes.RTLD_GLOBAL)
-                _LOGGER.debug(f"Successfully pre-loaded Alpine gcompat shim from {gcompat_path}")
-            except OSError as e:
-                _LOGGER.warning(f"Failed to pre-load gcompat shim! TUTK load may fail. Error: {e}")
-                
-    paths.extend([
-        # Standard glibc library for Debian/Ubuntu (Supervised/Core/Container)
-        os.path.join(os.path.dirname(__file__), "..", "libIOTCAPIs_ALL.so"),
-        # Global OS fallback paths
+    glibc_lib_path = os.path.join(base_dir, "..", "libIOTCAPIs_ALL.so")
+    alpine_lib_path = os.path.join(base_dir, "..", "libIOTCAPIs_ALL_alpine.so")
+    gcompat_path = os.path.join(base_dir, "..", "libgcompat.so.0")
+    
+    global_paths = [
         "/usr/local/lib/libIOTCAPIs_ALL.so",
         "/usr/lib/libIOTCAPIs_ALL.so",
-    ])
+    ]
+
     last_error = None
-    for path in paths:
+    
+    # 1. Try standard glibc library first 
+    if os.path.exists(glibc_lib_path):
+        _LOGGER.debug(f"Trying to load standard glibc TUTK library from: {glibc_lib_path}")
+        try:
+            return ctypes.cdll.LoadLibrary(glibc_lib_path)
+        except OSError as e:
+            _LOGGER.warning(f"Failed to load standard libIOTCAPIs_ALL.so. Error: {e}. Falling back to gcompat.")
+            last_error = e
+
+    # 2. If standard fails (likely missing glibc/ld-linux), try musl shim with patched library
+    if os.path.exists(gcompat_path) and os.path.exists(alpine_lib_path):
+        _LOGGER.debug(f"Attempting natively side-loaded gcompat shim from {gcompat_path}")
+        try:
+            # Pre-load gcompat into global symbol space
+            ctypes.CDLL(gcompat_path, mode=ctypes.RTLD_GLOBAL)
+            _LOGGER.debug(f"Successfully pre-loaded gcompat shim from {gcompat_path}")
+            
+            _LOGGER.debug(f"Trying to load patched TUTK library from: {alpine_lib_path}")
+            return ctypes.cdll.LoadLibrary(alpine_lib_path)
+        except OSError as e:
+            _LOGGER.warning(f"Failed to load gcompat or patched TUTK library. Error: {e}")
+            last_error = e
+
+    # 3. Try global paths
+    for path in global_paths:
         if os.path.exists(path):
-            _LOGGER.debug(f"Loading TUTK library from: {path}")
+            _LOGGER.debug(f"Trying global fallback TUTK library from: {path}")
             try:
                 return ctypes.cdll.LoadLibrary(path)
             except OSError as e:
-                _LOGGER.warning(f"Failed to load TUTK library {path}. Trying next path... Error: {e}")
+                _LOGGER.warning(f"Failed to load TUTK global library {path}. Error: {e}")
                 last_error = e
-    
+
     raise TutkError(f"Could not load any libIOTCAPIs shared object. Last error: {last_error}. Ensure your system has the required C libraries (glibc or musl).")
 
 class TutkClient:
