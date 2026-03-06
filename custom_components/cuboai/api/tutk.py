@@ -19,15 +19,31 @@ class TutkError(Exception):
     pass
 
 def load_library() -> CDLL:
-    paths = [
-        # Alpine/HAOS specific library first
-        os.path.join(os.path.dirname(__file__), "..", "libIOTCAPIs_ALL_alpine.so"),
-        # Check in the component directory for standard glibc library
+    paths = []
+    
+    # Check if we are running on Alpine Linux (HAOS typically uses Alpine)
+    if os.path.exists("/etc/alpine-release"):
+        _LOGGER.debug("Alpine Linux detected. Configuring native gcompat shim...")
+        gcompat_path = os.path.join(os.path.dirname(__file__), "..", "libgcompat.so.0")
+        alpine_lib_path = os.path.join(os.path.dirname(__file__), "..", "libIOTCAPIs_ALL_alpine.so")
+        
+        if os.path.exists(gcompat_path) and os.path.exists(alpine_lib_path):
+            paths.append(alpine_lib_path)
+            # Pre-load the glibc compatibility shim into the global symbol space 
+            # so the dynamic linker finds it when evaluating libIOTCAPIs
+            try:
+                ctypes.CDLL(gcompat_path, mode=ctypes.RTLD_GLOBAL)
+                _LOGGER.debug(f"Successfully pre-loaded Alpine gcompat shim from {gcompat_path}")
+            except OSError as e:
+                _LOGGER.warning(f"Failed to pre-load gcompat shim! TUTK load may fail. Error: {e}")
+                
+    paths.extend([
+        # Standard glibc library for Debian/Ubuntu (Supervised/Core/Container)
         os.path.join(os.path.dirname(__file__), "..", "libIOTCAPIs_ALL.so"),
-        # Global paths
+        # Global OS fallback paths
         "/usr/local/lib/libIOTCAPIs_ALL.so",
         "/usr/lib/libIOTCAPIs_ALL.so",
-    ]
+    ])
     last_error = None
     for path in paths:
         if os.path.exists(path):
