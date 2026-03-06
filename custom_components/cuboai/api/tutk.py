@@ -40,7 +40,7 @@ def load_library() -> CDLL:
         try:
             return ctypes.cdll.LoadLibrary(glibc_lib_path)
         except OSError as e:
-            _LOGGER.warning(f"Failed to load standard libIOTCAPIs_ALL.so. Error: {e}. Falling back to gcompat.")
+            _LOGGER.debug(f"Failed to load standard libIOTCAPIs_ALL.so. Error: {e}. Falling back to gcompat.")
             last_error = e
 
     # 2. If standard fails (likely missing glibc/ld-linux), try musl shim with patched library
