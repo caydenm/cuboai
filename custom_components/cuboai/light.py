@@ -12,15 +12,6 @@ async def async_setup_entry(hass, entry, async_add_entities):
     """Set up the CuboAI light platform."""
     cameras = entry.data.get("cameras", [])
     
-    tutk_supported = True
-    try:
-        from .api.tutk import load_library
-        # Attempt to load the library once before creating entities
-        load_library()
-    except Exception as e:
-        _LOGGER.error("Cannot enable Nightlight feature due to TUTK library error (Missing libc6-compat?): %s", e)
-        tutk_supported = False
-        
     entities = []
     for camera in cameras:
         uid = camera.get("device_id")
@@ -30,10 +21,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
         baby_name = camera.get("baby_name", "Unknown")
         
         # P2P requires the admin credentials extracted from the cloud API
-        if tutk_supported and uid and user and pwd and license_id:
+        if uid and user and pwd and license_id:
             entities.append(CuboNightLight(hass, baby_name, uid, license_id, user, pwd))
-        elif not tutk_supported:
-            _LOGGER.warning("Skipping nightlight for %s because TUTK library failed to load.", baby_name)
         else:
             _LOGGER.warning(
                 "Skipping nightlight for %s because admin credentials or license_id are missing. "
@@ -41,7 +30,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
             )
 
     if entities:
-        async_add_entities(entities, update_before_add=True)
+        async_add_entities(entities, update_before_add=False)
 
 class CuboNightLight(LightEntity):
     """Representation of a CuboAI Night Light."""
@@ -104,7 +93,14 @@ class CuboNightLight(LightEntity):
 
     async def async_update(self):
         """Fetch new state data for this light."""
+        if getattr(self, "_tutk_failed", False):
+            return
+
         try:
             self._is_on = await self._async_run_tutk_cmd(lambda c: c.get_night_light_status())
         except Exception as e:
-            _LOGGER.error("Failed to update CuboAI night light state: %s", e)
+            if "libc" in str(e) or "ld-linux" in str(e):
+                self._tutk_failed = True
+                _LOGGER.error("CuboAI Nightlight disabled: Native OS lacks glibc (HAOS/Alpine). You must use a Debian-based Home Assistant Container or advanced gcompat.")
+            else:
+                _LOGGER.error("Failed to update CuboAI night light state: %s", e)
