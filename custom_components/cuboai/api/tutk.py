@@ -20,40 +20,25 @@ class TutkError(Exception):
 
 def load_library() -> CDLL:
     paths = [
+        # Alpine/HAOS specific library first
+        os.path.join(os.path.dirname(__file__), "..", "libIOTCAPIs_ALL_alpine.so"),
         # Check in the component directory for standard glibc library
         os.path.join(os.path.dirname(__file__), "..", "libIOTCAPIs_ALL.so"),
         # Global paths
         "/usr/local/lib/libIOTCAPIs_ALL.so",
         "/usr/lib/libIOTCAPIs_ALL.so",
     ]
-    
-    # Try loading the library from the standard paths
+    last_error = None
     for path in paths:
         if os.path.exists(path):
+            _LOGGER.debug(f"Loading TUTK library from: {path}")
             try:
-                _LOGGER.debug(f"Loading TUTK library from: {path}")
                 return ctypes.cdll.LoadLibrary(path)
             except OSError as e:
-                _LOGGER.warning(f"Initial TUTK load failed at {path}: {e}")
-                
-                # If we hit an OSError here, it's very likely the Alpine ld-linux/glibc issue.
-                # Since HAOS containers run natively as root, we can repair the environment live.
-                import subprocess
-                _LOGGER.info("Attempting to auto-provision Alpine glibc compatibility (gcompat/libc6-compat)...")
-                try:
-                    subprocess.run(
-                        ["apk", "add", "-q", "--no-cache", "gcompat", "libc6-compat"],
-                        capture_output=True,
-                        check=False
-                    )
-                    # Retry loading after patching the OS
-                    _LOGGER.info("Retrying TUTK load after OS patch...")
-                    return ctypes.cdll.LoadLibrary(path)
-                except Exception as patch_e:
-                    _LOGGER.error(f"Failed to auto-provision gcompat: {patch_e}")
-                    raise TutkError(f"Could not load libIOTCAPIs shared object. Error: {e}. Missing C libraries (glibc/musl).")
+                _LOGGER.warning(f"Failed to load TUTK library {path}. Trying next path... Error: {e}")
+                last_error = e
     
-    raise TutkError("Could not find libIOTCAPIs_ALL.so. Make sure it is compiled for x86_64/aarch64 and placed in the custom_components/cuboai folder.")
+    raise TutkError(f"Could not load any libIOTCAPIs shared object. Last error: {last_error}. Ensure your system has the required C libraries (glibc or musl).")
 
 class TutkClient:
     def __init__(self, uid: str, license_id: str, admin_id: str, admin_pwd: str, region: int = 0):

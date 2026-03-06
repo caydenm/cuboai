@@ -125,29 +125,20 @@ class CuboAIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         "license_id": cam_info.get("license_id"),
                     })
 
-                username = user_input["username"]
-                new_data = {
-                    "uuid": uuid,
-                    "username": username,
-                    "client_id": CLIENT_ID,
-                    "client_secret": CLIENT_SECRET,
-                    "pool_id": POOL_ID,
-                    "region": REGION,
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                    "user_agent": user_agent,
-                    "cameras": cameras,
-                }
-
-                for entry in self.hass.config_entries.async_entries(DOMAIN):
-                    if entry.data.get("username") == username:
-                        self.hass.config_entries.async_update_entry(entry, data=new_data)
-                        self.hass.async_create_task(self.hass.config_entries.async_reload(entry.entry_id))
-                        return self.async_abort(reason="reauth_successful")
-
                 return self.async_create_entry(
-                    title=f"CuboAI ({username})",
-                    data=new_data,
+                    title=f"CuboAI ({user_input['username']})",
+                    data={
+                        "uuid": uuid,
+                        "username": user_input["username"],
+                        "client_id": CLIENT_ID,
+                        "client_secret": CLIENT_SECRET,
+                        "pool_id": POOL_ID,
+                        "region": REGION,
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "user_agent": user_agent,
+                        "cameras": cameras,
+                    },
                 )
 
             except Exception as e:
@@ -227,29 +218,20 @@ class CuboAIConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         "license_id": cam_info.get("license_id"),
                     })
 
-                username = self._username_input
-                new_data = {
-                    "uuid": uuid,
-                    "username": username,
-                    "client_id": CLIENT_ID,
-                    "client_secret": CLIENT_SECRET,
-                    "pool_id": POOL_ID,
-                    "region": REGION,
-                    "access_token": access_token,
-                    "refresh_token": refresh_token,
-                    "user_agent": self._user_agent,
-                    "cameras": cameras,
-                }
-
-                for entry in self.hass.config_entries.async_entries(DOMAIN):
-                    if entry.data.get("username") == username:
-                        self.hass.config_entries.async_update_entry(entry, data=new_data)
-                        self.hass.async_create_task(self.hass.config_entries.async_reload(entry.entry_id))
-                        return self.async_abort(reason="reauth_successful")
-
                 return self.async_create_entry(
-                    title=f"CuboAI ({username})",
-                    data=new_data,
+                    title=f"CuboAI ({self._username_input})",
+                    data={
+                        "uuid": uuid,
+                        "username": self._username_input,
+                        "client_id": CLIENT_ID,
+                        "client_secret": CLIENT_SECRET,
+                        "pool_id": POOL_ID,
+                        "region": REGION,
+                        "access_token": access_token,
+                        "refresh_token": refresh_token,
+                        "user_agent": self._user_agent,
+                        "cameras": cameras,
+                    },
                 )
 
             except Exception as e:
