@@ -40,27 +40,30 @@ def load_library() -> CDLL:
         try:
             return ctypes.cdll.LoadLibrary(glibc_lib_path)
         except OSError as e:
-            _LOGGER.warning(f"Failed to load standard libIOTCAPIs_ALL.so. Error: {e}. Falling back to gcompat.")
+            _LOGGER.debug(f"Failed to load standard libIOTCAPIs_ALL.so. Error: {e}. Falling back to gcompat.")
             last_error = e
 
     # 2. If standard fails (likely missing glibc/ld-linux), try musl shim with patched library
     if os.path.exists(gcompat_path) and os.path.exists(alpine_lib_path):
-        _LOGGER.debug(f"Attempting natively side-loaded gcompat shim from {gcompat_path}")
+        _LOGGER.warning(f"Attempting natively side-loaded gcompat shim from {gcompat_path}")
         try:
             # Pre-load gcompat dependencies
             if os.path.exists(ucontext_path):
+                _LOGGER.warning(f"Pre-loading {ucontext_path}")
                 ctypes.CDLL(ucontext_path, mode=ctypes.RTLD_GLOBAL)
             if os.path.exists(obstack_path):
+                _LOGGER.warning(f"Pre-loading {obstack_path}")
                 ctypes.CDLL(obstack_path, mode=ctypes.RTLD_GLOBAL)
                 
             # Pre-load gcompat into global symbol space
+            _LOGGER.warning(f"Pre-loading {gcompat_path}")
             ctypes.CDLL(gcompat_path, mode=ctypes.RTLD_GLOBAL)
-            _LOGGER.debug(f"Successfully pre-loaded gcompat shim from {gcompat_path}")
+            _LOGGER.warning(f"Successfully pre-loaded gcompat shim from {gcompat_path}")
             
-            _LOGGER.debug(f"Trying to load patched TUTK library from: {alpine_lib_path}")
+            _LOGGER.warning(f"Trying to load patched TUTK library from: {alpine_lib_path}")
             return ctypes.cdll.LoadLibrary(alpine_lib_path)
         except OSError as e:
-            _LOGGER.warning(f"Failed to load gcompat or patched TUTK library. Error: {e}")
+            _LOGGER.error(f"Failed to load gcompat or patched TUTK library. Error: {e}")
             last_error = e
 
     # 3. Try global paths
