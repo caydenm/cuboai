@@ -85,12 +85,14 @@ class TutkClient:
         self.admin_id = admin_id.encode("ascii")
         self.admin_pwd = admin_pwd.encode("ascii")
         self.region = region
-        self.lib = load_library()
+        self.lib = None
         self.session_id = -1
         self.av_chan_id = -1
-        self._initialize()
 
     def _initialize(self):
+        if self.lib is None:
+            self.lib = load_library()
+            
         try:
             ret = self.lib.TUTK_SDK_Set_License_Key(c_char_p(CUBO_TUTK_KEY.encode("ascii")))
             _LOGGER.debug(f"TUTK_SDK_Set_License_Key returned {ret}")
@@ -111,7 +113,9 @@ class TutkClient:
             raise TutkError(f"avInitialize failed: {ret}")
 
     def connect(self):
+        self._initialize()
         _LOGGER.debug(f"Connecting to UID {self.uid}")
+        
         session_id = self.lib.IOTC_Get_SessionID()
         if session_id < 0:
             raise TutkError(f"Failed to get session ID. Error: {session_id}")
@@ -180,8 +184,8 @@ class TutkClient:
         _LOGGER.debug(f"Successfully connected AV channel to {self.uid}")
 
     def send_io_ctrl(self, ctrl_type: int, payload: bytes) -> bytes:
-        if self.av_chan_id < 0:
-            raise TutkError("AV channel not started")
+        if self.av_chan_id < 0 or not self.lib:
+            raise TutkError("AV channel not started or lib not loaded")
             
         ret = self.lib.avSendIOCtrl(c_int(self.av_chan_id), c_int(ctrl_type), c_char_p(payload), c_int(len(payload)))
         if ret < 0:
@@ -238,9 +242,10 @@ class TutkClient:
         return False
         
     def disconnect(self):
-        if self.av_chan_id >= 0:
-            self.lib.avClientStop(c_int(self.av_chan_id))
-            self.av_chan_id = -1
-        if self.session_id >= 0:
-            self.lib.IOTC_Session_Close(c_int(self.session_id))
-            self.session_id = -1
+        if self.lib:
+            if self.av_chan_id >= 0:
+                self.lib.avClientStop(c_int(self.av_chan_id))
+                self.av_chan_id = -1
+            if self.session_id >= 0:
+                self.lib.IOTC_Session_Close(c_int(self.session_id))
+                self.session_id = -1
