@@ -201,11 +201,14 @@ class TutkClient:
         except Exception as e:
             pass
 
-    def send_io_ctrl(self, ctrl_type: int, payload: bytes) -> bytes:
+    def send_io_ctrl(self, ctrl_type: int, payload: bytes | None = None) -> bytes:
         if self.av_chan_id < 0 or not self.lib:
             raise TutkError("AV channel not started or lib not loaded")
             
-        ret = self.lib.avSendIOCtrl(c_int(self.av_chan_id), c_int(ctrl_type), c_char_p(payload), c_int(len(payload)))
+        cdata = c_char_p(payload) if payload else None
+        length = len(payload) if payload else 0
+        
+        ret = self.lib.avSendIOCtrl(c_int(self.av_chan_id), c_int(ctrl_type), cdata, c_int(length))
         if ret < 0:
             raise TutkError(f"avSendIOCtrl failed with code: {ret}")
             
@@ -214,7 +217,7 @@ class TutkClient:
         resp_buf = create_string_buffer(1024)
         
         # Give it a few tries to get the response
-        for _ in range(15):
+        for _ in range(4):
             ret = self.lib.avRecvIOCtrl(c_int(self.av_chan_id), byref(resp_type), resp_buf, c_int(1024), c_int(1000))
             if ret >= 0:
                 _LOGGER.debug(f"Received IO ctrl response type: {resp_type.value} (expected {ctrl_type + 1})")
@@ -244,7 +247,7 @@ class TutkClient:
     def set_night_light_status(self, state: bool) -> bool:
         # SMsgAVIoctrlSetNightLightOnOffReq: id(4), on_off(4), reserved(4) -> 12 bytes
         on_off_val = 1 if state else 0
-        payload = struct.pack("<iii", int(time.time()), on_off_val, 0)
+        payload = struct.pack("<iii", 0, on_off_val, 0)
         try:
             self.send_io_ctrl(IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_REQ, payload)
             return True
