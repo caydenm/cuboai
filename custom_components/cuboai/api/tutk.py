@@ -1,6 +1,6 @@
 import os
 import ctypes
-from ctypes import CDLL, c_int, c_int32, c_uint, c_uint32, c_uint8, c_char_p, pointer, Structure, c_char, LittleEndianStructure, sizeof, create_string_buffer, byref
+from ctypes import CDLL, c_int, c_int32, c_uint, c_uint16, c_uint32, c_uint8, c_char_p, pointer, Structure, c_char, LittleEndianStructure, sizeof, create_string_buffer, byref
 import struct
 import logging
 import time
@@ -126,7 +126,7 @@ class TutkClient:
         self.lib.IOTC_Setup_P2PConnection_Timeout(c_int(20000))
         self.lib.IOTC_Setup_LANConnection_Timeout(c_int(20000))
         
-        # ACTUALLY pass the dynamic license_id as the UID parameter
+        # Start the P2P Connection using the actual Device UID, not the license string
         ret = self.lib.IOTC_Connect_ByUID_Parallel(c_char_p(self.license_id.encode("ascii")), c_int(self.session_id))
         if ret < 0:
             self.lib.IOTC_Session_Close(c_int(self.session_id))
@@ -183,6 +183,24 @@ class TutkClient:
         self.av_chan_id = av_chan_id
         _LOGGER.debug(f"Successfully connected AV channel to {self.uid}")
 
+        class SInfoStruct(Structure):
+            _fields_ = [
+                ("mode", c_uint8), ("c_or_d", c_uint8), ("uid", c_char * 21),
+                ("remote_ip", c_char * 17), ("remote_port", c_uint8),
+                ("tx_packet_count", c_uint), ("rx_packet_count", c_uint),
+                ("iotc_version", c_uint), ("vendor_id", c_uint16),
+                ("product_id", c_uint16), ("group_id", c_uint16),
+                ("nat_type", c_uint8), ("is_secure", c_uint8),
+            ]
+        try:
+            sess_info = SInfoStruct()
+            err_code = self.lib.IOTC_Session_Check(c_int(self.session_id), byref(sess_info))
+            if err_code >= 0:
+                print(f"Session Diagnostic Info: UID={sess_info.uid.decode('ascii', errors='ignore')} "
+                      f"Remote_IP={sess_info.remote_ip.decode('ascii', errors='ignore')} Mode={sess_info.mode}")
+        except Exception as e:
+            pass
+
     def send_io_ctrl(self, ctrl_type: int, payload: bytes) -> bytes:
         if self.av_chan_id < 0 or not self.lib:
             raise TutkError("AV channel not started or lib not loaded")
@@ -196,7 +214,7 @@ class TutkClient:
         resp_buf = create_string_buffer(1024)
         
         # Give it a few tries to get the response
-        for _ in range(50):
+        for _ in range(15):
             ret = self.lib.avRecvIOCtrl(c_int(self.av_chan_id), byref(resp_type), resp_buf, c_int(1024), c_int(1000))
             if ret >= 0:
                 _LOGGER.debug(f"Received IO ctrl response type: {resp_type.value} (expected {ctrl_type + 1})")
@@ -209,25 +227,18 @@ class TutkClient:
         raise TutkError(f"Failed to receive IO ctrl response {ctrl_type+1} (Timeout)")
 
     def get_night_light_status(self) -> bool:
-        # SMsgAVIoctrlGetNightLightOnOffReq doesn't seem to have a payload based on decompiled source analysis,
-        # but let's check SMsgAVIoctrlGetNightLightOnOffReq just in case it requires an ID.
-        # usually Get requests like this are empty or just an ID + reserved.
-        # Actually CameraCommandFactory just instantiates and toBytes:
-        # public CameraCommand getNightLightGetCommand() {
-        #    return new CameraCommand(4352, new SMsgAVIoctrlGetNightLightOnOffReq().toBytes());
-        # }
-        # Assuming 8 bytes: id + reserved. We'll send 8 empty bytes or a dummy ID.
-        payload = struct.pack("<ii", int(time.time()), 0)
+        # Cubo SDK uses (byte[]) new byte[0] for GET queries
+        payload = b""
         
         try:
             resp = self.send_io_ctrl(IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_REQ, payload)
+            _LOGGER.debug(f"Received Nightlight GET Res: {resp}")
             if len(resp) >= 12:
                 # SMsgAVIoctrlGetNightLightOnOffResp: id(4), result(4), on_off(4), reserved(4)
-                # First 12 bytes are the id, result, and on_off state
                 msg_id, result, on_off = struct.unpack("<iii", resp[:12])
                 return on_off == 1
         except Exception as e:
-            print(f"Error getting night light: {e}")
+            pass
         return False
         
     def set_night_light_status(self, state: bool) -> bool:
