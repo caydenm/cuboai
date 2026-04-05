@@ -80,7 +80,6 @@ class TestCuboNightLight:
             assert light.is_on is True
             mock_tutk_client.connect.assert_called_once()
             mock_tutk_client.set_night_light_status.assert_called_once_with(True)
-            mock_tutk_client.disconnect.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_async_turn_off(self, mock_tutk_client):

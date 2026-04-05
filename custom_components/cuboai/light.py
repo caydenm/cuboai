@@ -1,4 +1,5 @@
 import logging
+import asyncio
 
 from homeassistant.components.light import LightEntity, ColorMode
 from homeassistant.helpers.entity import DeviceInfo
@@ -50,6 +51,10 @@ class CuboNightLight(LightEntity):
         self._dev_admin_pwd = dev_admin_pwd
         self._is_on: bool | None = None
         self._attr_unique_id = f"cuboai_nightlight_{uid}"
+        self._client = TutkClient(self._uid, self._license_id, self._dev_admin_id, self._dev_admin_pwd)
+        self._connected = False
+
+        self._lock = asyncio.Lock()
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -67,17 +72,24 @@ class CuboNightLight(LightEntity):
         return self._is_on
 
     async def _async_run_tutk_cmd(self, func, *args):
-        def _run():
-            client = TutkClient(self._uid, self._license_id, self._dev_admin_id, self._dev_admin_pwd)
-            try:
-                client.connect()
-                return func(client, *args)
-            finally:
-                client.disconnect()
+        async with self._lock:
+            def _run():
+                try:
+                    if not self._connected:
+                        self._client.connect()
+                        self._connected = True
+                    return func(self._client, *args)
+                except Exception as tuple_err:
+                    _LOGGER.error(f"TUTK connection/execution failed: {tuple_err}")
+                    self._connected = False
+                    try:
+                        self._client.disconnect()
+                    except Exception:
+                        pass
+                    raise tuple_err
 
-        import asyncio
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _run)
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(None, _run)
 
     async def async_turn_on(self, **kwargs):
         """Instruct the light to turn on."""
@@ -93,14 +105,12 @@ class CuboNightLight(LightEntity):
 
     async def async_update(self):
         """Fetch new state data for this light."""
-        if getattr(self, "_tutk_failed", False):
-            return
+        if getattr(self, "_connected", False) is False:
+            # First time or disconnected, will be connected on command
+            pass
 
         try:
             self._is_on = await self._async_run_tutk_cmd(lambda c: c.get_night_light_status())
         except Exception as e:
-            if "libc" in str(e) or "ld-linux" in str(e):
-                self._tutk_failed = True
-                _LOGGER.error("CuboAI Nightlight disabled: Native OS lacks glibc (HAOS/Alpine). You must use a Debian-based Home Assistant Container or advanced gcompat.")
-            else:
-                _LOGGER.error("Failed to update CuboAI night light state: %s", e)
+            _LOGGER.error("Failed to update CuboAI night light state: %s", e)
+
