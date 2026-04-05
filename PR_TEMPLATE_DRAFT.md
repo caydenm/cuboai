@@ -1,26 +1,21 @@
-# PR Title: feat: Add Nightlight control via TUTK P2P protocol
+# PR Title: feat: Add Pure Python Nightlight control via TUTK Protocol (Drop C Library Dependency)
 
 ## Description
-This PR introduces native control for the CuboAI Nightlight feature. The nightlight control operates on a local P2P connection rather than the standard cloud API endpoints, which required introducing the TUTK SDK.
+This PR introduces native control for the CuboAI Nightlight feature using a **pure Python** implementation of the TUTK (ThroughTek) IOTC protocol. This completely eliminates the previous `libIOTCAPIs_ALL.so` C library dependency, fully resolving the deployment failures and `glibc` library crashes experienced by Home Assistant OS users on Alpine Linux.
 
 ### Key Changes:
-- **P2P Communication (`tutk.py`)**: Added a Python wrapper around the `libIOTCAPIs_ALL.so` library to establish P2P sessions and send IO control commands directly to the camera to toggle the nightlight.
-- **Native Light Entity (`light.py`)**: Created the `CuboNightLight` class extending Home Assistant's `LightEntity`. It operates statelessly, spinning up its own `TutkClient` on demand using securely stored device credentials.
-- **Credential Persistence (`config_flow.py` & API)**: Updated the multi-camera device profiles mapping to extract and store the required P2P credentials (`license_id`, `dev_admin_id`, `dev_admin_pwd`) seamlessly during the config flow setup.
-- **Tests**: Refactored existing data structure assertions in `test_config_flow.py`, `test_async_api.py`, and `test_multi_camera.py` to support the new credential pairs without breaking backwards compatibility. Added `test_light.py` to mock and verify the native entity.
-
-All required secrets are now handled securely following Home Assistant's standard ConfigEntry patterns without exposing sensitive variable logs.
-
-## Related Issues
-*(Link any related issues here if applicable)*
+- **Pure Python TUTK Implementation (`api/tutk.py` & `api/crypto.py`)**: Reverse-engineered the TUTK UDP transport obfuscation (`TransCodePartial` bitwise manipulation) and IOTC session handshake to build a fully native Python protocol handler.
+- **Removed C Dependencies**: Deleted all `.so` binaries (`libIOTCAPIs_ALL.so`, `libgcompat.so`, etc.) decreasing the repository distribution payload by over 10 MB and removing ABI incompatibilities.
+- **Native Light Entity (`light.py`)**: Refactored the `CuboNightLight` class to consume the new pure Python `TutkClient`, optimizing it to maintain connections instead of rapidly opening/closing them, increasing toggling stability and speed.
+- **Tests**: Re-wrote `test_light.py` to assert against the async execution behaviors of the pure Python component, achieving 100% test passing success cleanly without native binaries.
 
 ## Type of Change
 - [x] New feature (non-breaking change which adds functionality)
-- [ ] Bug fix (non-breaking change which fixes an issue)
+- [x] Bug fix (non-breaking change which fixes an issue - resolves HAOS crash)
 - [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
-- [ ] Documentation update
+- [x] Documentation update
 
 ## Testing Performed
-- [x] Verified P2P `avRecvIOCtrl` commands toggle the physical device state.
-- [x] Verified Pytest passes with `100%` success locally across 76 unified test paths.
-- [x] Verified back-compat login flow fallback behavior functions safely.
+- [x] Verified pure Python protocol bit-for-bit matches C library packet traces.
+- [x] Verified P2P nightlight toggle commands function cleanly via UDP socket transmission.
+- [x] Verified Pytest passes with `100%` success locally.
