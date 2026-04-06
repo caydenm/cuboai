@@ -728,6 +728,11 @@ class AVChannel:
             if expected_type == 0 or io_type == expected_type:
                 _LOGGER.debug(f"recv_ioctrl type=0x{io_type:04x}")
                 return io_type, user_payload
+            else:
+                _LOGGER.debug(
+                    f"recv_ioctrl [{pkt_idx}] SKIP io=0x{io_type:04x} "
+                    f"(want 0x{expected_type:04x}) data[0:8]={data[0:8].hex()}"
+                )
 
         raise TutkTimeoutError(
             f"IOCtrl response timeout (expected 0x{expected_type:04x})"
