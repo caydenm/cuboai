@@ -684,6 +684,9 @@ class AVChannel:
         full_payload = bytes(av_header) + io_data
 
         _LOGGER.debug(f"send_ioctrl type=0x{io_type:04x} seq={self._av_seq}")
+        _LOGGER.debug(f"  AV_HDR: {bytes(av_header).hex()}")
+        _LOGGER.debug(f"  IO_DATA: {io_data.hex()}")
+        _LOGGER.debug(f"  FULL: {full_payload.hex()}")
 
         self.transport.send_session_data(full_payload, magic=b'\x1a\x0a')
 
