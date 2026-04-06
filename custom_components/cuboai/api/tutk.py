@@ -163,59 +163,65 @@ class TutkTransport:
     def _get_discovery_targets(self):
         """
         Build a list of (ip, port) tuples to send discovery packets to.
-        Includes broadcast addresses and unicast to every host on local /24 subnets.
+        Detects local subnet via /proc/net/route or socket trick,
+        then sends broadcast + unicast to every host on /24.
         """
         targets = [
             ('255.255.255.255', TUTK_LAN_SEARCH_PORT),
         ]
+        scanned_prefixes = set()
 
-        # Detect local network interfaces to find subnet broadcast + unicast targets
+        # Method 1: Read default gateway from /proc/net/route (Linux)
         try:
-            import fcntl
-            import array
-
-            # Get list of network interfaces via ioctl
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            max_interfaces = 32
-            buf = array.array('B', b'\0' * max_interfaces * 40)
-            try:
-                import struct as _struct
-                result = fcntl.ioctl(s.fileno(), 0x8912,  # SIOCGIFCONF
-                                     _struct.pack('iL', max_interfaces * 40, buf.buffer_info()[0]))
-                result_len = _struct.unpack('iL', result)[0]
-                data = buf.tobytes()[:result_len]
-
-                offset = 0
-                while offset < len(data):
-                    iface_name = data[offset:offset+16].split(b'\0', 1)[0].decode('ascii', errors='ignore')
-                    ip_bytes = data[offset+20:offset+24]
-                    ip_addr = socket.inet_ntoa(ip_bytes)
-                    offset += 40
-
-                    if ip_addr.startswith('127.') or ip_addr == '0.0.0.0':
+            with open('/proc/net/route', 'r') as f:
+                for line in f.readlines()[1:]:
+                    fields = line.strip().split()
+                    if len(fields) >= 3 and fields[1] != '00000000':
                         continue
+                    if len(fields) >= 3 and fields[1] == '00000000':
+                        # Default route found — get gateway IP
+                        gw_hex = fields[2]
+                        gw_ip = '.'.join(str(int(gw_hex[i:i+2], 16))
+                                         for i in range(0, 8, 2))
+                        parts = gw_ip.split('.')
+                        prefix = f"{parts[0]}.{parts[1]}.{parts[2]}"
+                        if prefix not in scanned_prefixes:
+                            scanned_prefixes.add(prefix)
+                            _LOGGER.debug(f"Discovery: gateway subnet {prefix}.0/24")
+                        break
+        except Exception:
+            pass
 
-                    # Add subnet broadcast
-                    parts = ip_addr.split('.')
-                    subnet_broadcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
-                    targets.append((subnet_broadcast, TUTK_LAN_SEARCH_PORT))
-
-                    # Add unicast for every host on the /24 subnet
-                    prefix = f"{parts[0]}.{parts[1]}.{parts[2]}"
-                    for host in range(1, 255):
-                        targets.append((f"{prefix}.{host}", TUTK_LAN_SEARCH_PORT))
-
-                    _LOGGER.debug(f"Discovery: scanning subnet {prefix}.0/24 via {iface_name} ({ip_addr})")
+        # Method 2: Connect to a public IP to find our local address
+        try:
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            probe.settimeout(0)
+            try:
+                probe.connect(('10.255.255.255', 1))
+                local_ip = probe.getsockname()[0]
+                parts = local_ip.split('.')
+                prefix = f"{parts[0]}.{parts[1]}.{parts[2]}"
+                if prefix not in scanned_prefixes:
+                    scanned_prefixes.add(prefix)
+                    _LOGGER.debug(f"Discovery: local subnet {prefix}.0/24")
             finally:
-                s.close()
-        except Exception as e:
-            _LOGGER.debug(f"Interface detection failed ({e}), using fallback subnets")
-            # Fallback: common home subnets
-            for prefix in ['192.168.1', '192.168.0', '10.0.0', '172.16.0']:
-                targets.append((f"{prefix}.255", TUTK_LAN_SEARCH_PORT))
-                for host in range(1, 255):
-                    targets.append((f"{prefix}.{host}", TUTK_LAN_SEARCH_PORT))
+                probe.close()
+        except Exception:
+            pass
 
+        # Fallback if nothing detected
+        if not scanned_prefixes:
+            for prefix in ['192.168.1', '192.168.0', '10.0.0']:
+                scanned_prefixes.add(prefix)
+
+        # Build target list: broadcast + unicast for each subnet
+        for prefix in scanned_prefixes:
+            targets.append((f"{prefix}.255", TUTK_LAN_SEARCH_PORT))
+            for host in range(1, 255):
+                targets.append((f"{prefix}.{host}", TUTK_LAN_SEARCH_PORT))
+
+        _LOGGER.info(f"Discovery: scanning {len(scanned_prefixes)} subnet(s), "
+                     f"{len(targets)} targets")
         return targets
 
     def _build_lan_search_packet(self, uid: str) -> bytes:
