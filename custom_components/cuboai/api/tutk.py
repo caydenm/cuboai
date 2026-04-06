@@ -469,6 +469,14 @@ class TutkTransport:
 
                 decoded = self._deobfuscate(data)
                 msg_type = decoded[2:4]
+
+                # Auto-ACK received 1d0a data packets to maintain
+                # reliable delivery (camera won't process SET commands
+                # without session-level acknowledgments)
+                if msg_type == b'\x1d\x0a' and len(decoded) >= 8:
+                    recv_seq = struct.unpack('<H', decoded[6:8])[0]
+                    self._send_session_ack(recv_seq)
+
                 return msg_type, decoded
             except socket.timeout:
                 continue
@@ -476,6 +484,23 @@ class TutkTransport:
                 _LOGGER.error(f"recv_session_data error: {e}")
                 break
         return None
+
+    def _send_session_ack(self, acked_seq: int):
+        """
+        Send a session-level ACK (0x0900) for the given received sequence.
+        Required by the TUTK reliable delivery layer — the camera won't
+        process write commands (SET) until it knows its data is being received.
+        """
+        ack_data = bytearray(24)
+        ack_data[0:2] = b'\x09\x00'       # ACK magic
+        ack_data[2:4] = b'\x0b\x00'       # channel
+        struct.pack_into('<I', ack_data, 4, acked_seq)
+        ack_data[8:12] = b'\xff\xff\xff\xff'
+        # [12:24] = zeros (recv count, channel data, trailer)
+        try:
+            self.send_session_data(bytes(ack_data), magic=b'\x1a\x0a')
+        except Exception:
+            pass  # Best-effort ACK
 
     def close(self):
         self._connected = False
