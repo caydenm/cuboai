@@ -23,7 +23,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
         
         # P2P requires the admin credentials extracted from the cloud API
         if uid and user and pwd and license_id:
-            entities.append(CuboNightLight(hass, baby_name, uid, license_id, user, pwd))
+            entities.append(CuboNightLight(hass, baby_name, uid, license_id, user, pwd, camera))
         else:
             _LOGGER.warning(
                 "Skipping nightlight for %s because admin credentials or license_id are missing. "
@@ -41,7 +41,7 @@ class CuboNightLight(LightEntity):
     _attr_color_mode = ColorMode.ONOFF
     _attr_supported_color_modes = {ColorMode.ONOFF}
 
-    def __init__(self, hass, baby_name, uid, license_id, dev_admin_id, dev_admin_pwd):
+    def __init__(self, hass, baby_name, uid, license_id, dev_admin_id, dev_admin_pwd, camera_data):
         """Initialize the light."""
         self.hass = hass
         self._baby_name = baby_name
@@ -49,6 +49,7 @@ class CuboNightLight(LightEntity):
         self._license_id = license_id
         self._dev_admin_id = dev_admin_id
         self._dev_admin_pwd = dev_admin_pwd
+        self._ip_address = camera_data.get("ip_address") or camera_data.get("host")
         self._is_on: bool | None = None
         self._attr_unique_id = f"cuboai_nightlight_{uid}"
         self._client = TutkClient(self._uid, self._license_id, self._dev_admin_id, self._dev_admin_pwd)
@@ -76,7 +77,7 @@ class CuboNightLight(LightEntity):
             def _run():
                 try:
                     if not self._connected:
-                        self._client.connect()
+                        self._client.connect(ip=self._ip_address)
                         self._connected = True
                     return func(self._client, *args)
                 except Exception as tuple_err:
