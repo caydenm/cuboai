@@ -656,7 +656,7 @@ class AVChannel:
         struct.pack_into('<I', reg_payload, 514, 0x001F07FB)
         reg_payload[528] = 0x03  # [528:532] = 03000000
 
-        _LOGGER.info(f"Sending device registration (dev_id={self.uid})")
+        _LOGGER.info(f"Sending device registration (dev_id={dev_id})")
         self.send_ioctrl(0x5753406e, bytes(reg_payload))
         _LOGGER.info("Device registration sent")
 
