@@ -702,12 +702,18 @@ class AVChannel:
         Returns (io_type, user_payload_bytes).
         """
         start = time.time()
+        pkt_idx = 0
         while time.time() - start < timeout:
             res = self.transport.recv_session_data(timeout=1.0)
             if not res:
                 continue
 
             msg_type, full_decoded = res
+            pkt_idx += 1
+            _LOGGER.debug(
+                f"recv_ioctrl [{pkt_idx}] type={msg_type.hex()} "
+                f"len={len(full_decoded)} expecting=0x{expected_type:04x}"
+            )
 
             if msg_type != b'\x1d\x0a' or len(full_decoded) < 56:
                 continue
@@ -838,7 +844,7 @@ class TutkClient:
             try:
                 io_type, resp = self.av_channel.recv_ioctrl(
                     IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_RESP,
-                    timeout=5.0
+                    timeout=15.0
                 )
                 _LOGGER.info(f"SET response received: {resp.hex()}")
                 return True
