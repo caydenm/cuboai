@@ -545,6 +545,7 @@ class AVChannel:
           [536:570] trailer      (34 bytes of flags)
         """
         _LOGGER.info(f"Authenticating AV channel ({admin_id})...")
+        self.admin_pwd = admin_pwd
 
         payload = bytearray(AV_AUTH_TOTAL_SIZE)
 
@@ -604,6 +605,7 @@ class AVChannel:
                 if data[0:4] == b'\x00\x70\x0b\x00':
                     _LOGGER.info(f"AV auth response received (len {len(data)})")
                     self._auth_ok = True
+                    self._send_device_registration()
                     return True
             
             # 1d02 = handshake confirmation
@@ -615,9 +617,48 @@ class AVChannel:
             _LOGGER.warning("Handshake seen but no AV auth response; "
                             "treating as authenticated")
             self._auth_ok = True
+            self._send_device_registration()
             return True
 
         return False
+
+    def _send_device_registration(self):
+        """
+        Send the device registration command (io_type 0x5753406e).
+
+        The C SDK sends this after AV auth and before any IOCtrl commands.
+        Without it, the camera accepts the session but treats the client
+        as view-only — GET responses stream but SET commands are ignored.
+
+        Payload layout (538 bytes):
+          [0:200]   device_id (ASCII, null-padded)
+          [200:249] zeros
+          [249:261] admin_pwd (ASCII, null-padded)
+          [261:510] zeros
+          [510:538] trailer constants
+        """
+        if not hasattr(self, 'admin_pwd'):
+            _LOGGER.warning("No admin_pwd set, skipping device registration")
+            return
+
+        reg_payload = bytearray(538)
+
+        # Device ID — self.uid is the CuboAI device serial (e.g. "05A8E2916D0B2B")
+        dev_id_bytes = self.uid.encode('ascii')[:200]
+        reg_payload[0:len(dev_id_bytes)] = dev_id_bytes
+
+        # Admin password at offset 249
+        pwd_bytes = self.admin_pwd.encode('ascii')[:12]
+        reg_payload[249:249 + len(pwd_bytes)] = pwd_bytes
+
+        # Trailer constants (from golden trace)
+        reg_payload[510] = 0x04  # [510:514] = 04000000
+        struct.pack_into('<I', reg_payload, 514, 0x001F07FB)
+        reg_payload[528] = 0x03  # [528:532] = 03000000
+
+        _LOGGER.info(f"Sending device registration (dev_id={dev_id})")
+        self.send_ioctrl(0x5753406e, bytes(reg_payload))
+        _LOGGER.info("Device registration sent")
 
     def _send_session_confirm(self):
         """
