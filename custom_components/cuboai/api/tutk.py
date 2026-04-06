@@ -17,7 +17,12 @@ import socket
 import struct
 import threading
 import time
-from typing import Optional, Tuple
+# import boto3
+import jwt
+import requests
+# from pycognito.aws_srp import AWSSRP
+from typing import Optional, Tuple, Dict
+from collections import defaultdict
 
 # Try relative import for HA, fallback for standalone tests
 try:
@@ -86,7 +91,7 @@ class TutkTransport:
         self._connected: bool = False
         # 20-byte session context, derived from handshake
         self._session_context: bytearray = bytearray(20)
-        self._seq_send: int = 0
+        self._seq_send = defaultdict(int)
         self._lock = threading.Lock()
         self._recv_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -395,14 +400,14 @@ class TutkTransport:
         pkt[0:4] = b'\x04\x02' + magic
         length = len(payload) + 12
         pkt[4:6] = struct.pack("<H", length)
-        pkt[6:8] = struct.pack("<H", self._seq_send)
+        pkt[6:8] = struct.pack("<H", self._seq_send[magic])
         
         if hasattr(self, '_session_context') and len(self._session_context) == 20:
             pkt[8:28] = self._session_context
         
         pkt[28:total_len] = payload
         
-        self._seq_send += 1
+        self._seq_send[magic] += 1
         return bytes(pkt)
 
     def send_session_data(self, payload: bytes,
@@ -435,8 +440,8 @@ class TutkTransport:
                 self.sock.settimeout(0.0)
                 try:
                     count = 0
-                    while count < 5000:
-                        self.sock.recvfrom(2048)
+                    while count < 10000:
+                        self.sock.recvfrom(4096)
                         count += 1
                 except (BlockingIOError, socket.error):
                     # Buffer is empty
@@ -526,7 +531,9 @@ class AVChannel:
         self.transport = transport
         self.uid = uid
         self._auth_ok = False
+        self._auth_token = b'\x00' * 28
         self._av_seq = 0
+        self._av_seq_lock = threading.Lock()
         # Write counter from golden trace (increments per-command-type cycle)
         self._write_counter = 0
 
@@ -565,15 +572,10 @@ class AVChannel:
         pwd_bytes = admin_pwd.encode('ascii')[:255]
         payload[281:281 + len(pwd_bytes)] = pwd_bytes
 
-        # Trailer (verified byte-by-byte from full golden trace)
-        # [542:546] = 04000000, [546:550] = fb071f00
-        # [550:560] = 10 byte zeroes, [560:564] = 03000000
-        # [564:568] = 261b0815, [568:570] = 020c
-        payload[542:546] = b'\x04\x00\x00\x00'
-        payload[546:550] = b'\xfb\x07\x1f\x00'
-        payload[560:564] = b'\x03\x00\x00\x00'
-        payload[564:568] = b'\x26\x1b\x08\x15'
-        payload[568:570] = b'\x02\x0c'
+        # Trailer (34 bytes at offset 536 - exactly matched from golden trace)
+        # These flags indicate client capabilities and are required for state modification.
+        trailer = bytes.fromhex("00000000000004000000fb071f000000000000000000000003000000000000000000")
+        payload[536:570] = trailer
 
         # Send auth payload via session frame (single obfuscation via
         # send_session_data → _build_session_frame → _obfuscate)
@@ -588,8 +590,10 @@ class AVChannel:
         while time.time() - start < timeout:
             res = self.transport.recv_session_data(timeout=2.0)
             if not res:
+                _LOGGER.debug("recv_session_data timeout during auth loop")
                 # Retry auth send
                 if not handshake_seen:
+                    _LOGGER.debug("Retrying auth send...")
                     self.transport.send_session_data(
                         bytes(payload), magic=b'\x1a\x0a'
                     )
@@ -597,13 +601,17 @@ class AVChannel:
                 continue
                 
             msg_type, full_decoded = res
+            _LOGGER.debug(f"AUTH LOOP RECV: type={msg_type.hex()} len={len(full_decoded)} data[0:8]={full_decoded[28:36].hex() if len(full_decoded)>=36 else 'N/A'}")
             
             # 1d0a = AV session data (auth response expected here)
-            if msg_type == b'\x1d\x0a' and len(full_decoded) >= 68:
+            if msg_type == b'\x1d\x0a' and len(full_decoded) >= 60:
                 data = full_decoded[28:]
-                if data[0:4] == b'\x00\x70\x0b\x00':
+                if data[0:4] == b'\x00\x21\x0b\x00':  # 0x000b2100 = AV_AUTH_RESP
                     _LOGGER.info(f"AV auth response received (len {len(data)})")
+                    # Capture the 28-byte session token following the 4-byte magic
+                    self._auth_token = data[4:32]
                     self._auth_ok = True
+                    self._start_keepalive()
                     return True
             
             # 1d02 = handshake confirmation
@@ -615,35 +623,56 @@ class AVChannel:
             _LOGGER.warning("Handshake seen but no AV auth response; "
                             "treating as authenticated")
             self._auth_ok = True
+            self._start_keepalive()
             return True
 
         return False
 
     def _send_session_confirm(self):
         """
-        Send the 52-byte session-confirm packet (golden trace line 18).
-
-        This is a 1a02-typed control packet containing the UID and token.
+        Send the 52-byte session-confirm (Handshake 2) packet.
+        Magic: 0x1a 0x02, Payload Magic: 0x02043300
         """
-        raw24 = bytearray(24)
-        raw24[0:4] = b'\x04\x02\x1d\x03'
-        raw24[4:8] = struct.pack("<I", 8)
-        if hasattr(self.transport, '_session_context') and len(self.transport._session_context) == 20:
-            raw24[8:24] = b'\x02\x04\x33\x00' + self.transport._session_context[4:16]
-        else:
-            raw24[8:12] = b'\x02\x04\x33\x00'
-        
-        self.transport.send_raw(self.transport._obfuscate(bytes(raw24)))
-        
-        # Wait for Handshake 2 Response
-        start = time.time()
-        while time.time() - start < 2.0:
-            res = self.transport.recv_session_data(timeout=0.5)
-            if res:
-                if res[0] == b'\x1d\x04' or res[0] == b'\x1d\x02':
-                    pass
-                if len(res[1]) <= 52 and res[0] == b'\x1d\x02':
-                    break
+        payload = bytearray(24)
+        # Payload magic 0x00330402 as seen in golden trace (little endian of trace bytes 02 04 33 00)
+        payload[0:4] = b'\x02\x04\x33\x00'
+        # The trace shows 20 bytes of zeros following it
+        self.transport.send_session_data(bytes(payload), magic=b'\x1a\x02')
+
+    def _start_keepalive(self):
+        """Start background thread pumping fake A/V dummy frames."""
+        import threading
+        if hasattr(self, "_keep_alive_running") and self._keepalive_running:
+            return
+            
+        self._keepalive_running = True
+        self._keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
+        self._keepalive_thread.start()
+
+    def _keepalive_loop(self):
+        import struct
+        import time
+        # Send a mixture of dummy audio/video packets every 50ms (simulating 20fps)
+        while getattr(self, "_keepalive_running", False):
+            # Send Dummy Audio (codec 0x09)
+            # Trace: 09 00 0b 00 {seq} 00 05 00 ff ff ff ff 00 00 00 00 00 00 00 00 22 1a fd 76
+            d1 = bytearray(bytes.fromhex("09000b0000000500ffffffff0000000000000000221afd76"))
+            # Send Dummy Video (codec 0x0a)
+            # Trace: 0a 08 0b 00 {seq} 00 05 00 df 6c 32 00 00 00 00 00
+            d2 = bytearray(bytes.fromhex("0a080b0000000500df6c320000000000"))
+            
+            with self._av_seq_lock:
+                # 09 packet
+                struct.pack_into("<H", d1, 4, self._av_seq)
+                self._av_seq += 1
+                self.transport.send_session_data(d1)
+                
+                # 0a packet
+                struct.pack_into("<H", d2, 4, self._av_seq)
+                self._av_seq += 1
+                self.transport.send_session_data(d2)
+
+            time.sleep(0.05)
         raw = bytearray(52)
         raw[0:4] = b'\x04\x02\x1a\x02'
         raw[4:8] = struct.pack("<I", 36)
@@ -665,12 +694,20 @@ class AVChannel:
         if not self._auth_ok:
             raise TutkError("Not authenticated")
 
-        inner_len = 4 + len(user_payload)  # io_type + user data
+        # Inner Length (Total payload after 28-byte AV_HDR)
+        # Includes io_type(4) + user_payload + session_token(28)
+        inner_len = 4 + len(user_payload) + len(self._auth_token)
 
         av_header = bytearray(28)
         av_header[0:4] = b'\x00\x70\x0b\x00'
-        struct.pack_into("<H", av_header, 4, self._av_seq)
-        av_header[6:8] = b'\x59\x46'
+        
+        with self._av_seq_lock:
+            seq_to_use = self._av_seq
+            self._av_seq += 1
+            
+        struct.pack_into("<H", av_header, 4, seq_to_use)
+        # magic2 - verified as 00 00 in working trace responses
+        av_header[6:8] = b'\x00\x00'
         # Channel flags: 00 70 XX 00 where XX tracks write phase
         av_header[8:12] = struct.pack("<I", 0x00007000 | ((self._write_counter & 0xFF) << 16))
         struct.pack_into("<I", av_header, 12, 1)   # action = 1
@@ -678,19 +715,49 @@ class AVChannel:
         struct.pack_into("<I", av_header, 20, self._write_counter)
         # [24:28] = zeros (reserved)
 
-        # IO type + user payload
-        io_data = struct.pack("<I", io_type) + user_payload
+        # IO_TYPE (4) + USER_PAYLOAD + SESSION_TOKEN (28)
+        full_io_payload = struct.pack("<I", io_type) + user_payload + self._auth_token
+        full_payload = bytes(av_header) + full_io_payload
 
-        full_payload = bytes(av_header) + io_data
+        if io_type == 4354: # IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_REQ
+            # Simulation of AV stream for command acceptance
+            # Pack dummies with contiguous seqs
+            ts = int(time.time() * 1000) & 0xFFFFFFFF
+            
+            # Audio Dummy (Magic 09 00 0b 00)
+            d1 = bytearray(24)
+            d1[0:4] = b'\x09\x00\x0b\x00'
+            struct.pack_into("<H", d1, 4, seq_to_use)
+            d1[6:12] = b'\x00\x00\xff\xff\xff\xff'
+            struct.pack_into("<I", d1, 12, ts)
+            d1[20:24] = b'\x22\x1a\x00\x00'
+            self.transport.send_session_data(bytes(d1))
+            
+            # Double Audio Dummy as seen in trace
+            d2 = bytearray(d1)
+            struct.pack_into("<H", d2, 4, seq_to_use + 1)
+            self.transport.send_session_data(bytes(d2))
+            
+            # The actual SET command
+            struct.pack_into("<H", av_header, 4, seq_to_use + 2)
+            full_payload = bytes(av_header) + full_io_payload
+            _LOGGER.debug(f"send_ioctrl (SET) type=0x{io_type:04x} seq={seq_to_use + 2}")
+            self.transport.send_session_data(full_payload, magic=b'\x1a\x0a')
+            
+            # Video Dummy (Magic 0a 08 0b 00)
+            d3 = bytearray(16)
+            d3[0:4] = b'\x0a\x08\x0b\x00'
+            struct.pack_into("<H", d3, 4, seq_to_use + 3)
+            struct.pack_into("<I", d3, 8, ts + 50)
+            self.transport.send_session_data(bytes(d3))
+            
+            with self._av_seq_lock:
+                self._av_seq = seq_to_use + 4
+        else:
+            _LOGGER.info(f"Captured Token: {self._auth_token.hex()}")
+            _LOGGER.debug(f"send_ioctrl type=0x{io_type:04x} seq={seq_to_use}")
+            self.transport.send_session_data(full_payload, magic=b'\x1a\x0a')
 
-        _LOGGER.debug(f"send_ioctrl type=0x{io_type:04x} seq={self._av_seq}")
-        _LOGGER.debug(f"  AV_HDR: {bytes(av_header).hex()}")
-        _LOGGER.debug(f"  IO_DATA: {io_data.hex()}")
-        _LOGGER.debug(f"  FULL: {full_payload.hex()}")
-
-        self.transport.send_session_data(full_payload, magic=b'\x1a\x0a')
-
-        self._av_seq += 1
         self._write_counter += 1
         return 0
 
@@ -698,44 +765,40 @@ class AVChannel:
                     timeout: float = 5.0) -> Tuple[int, bytes]:
         """
         Receive an IOCtrl response.
-
-        Parses the AV header to extract io_type at offset [28:32]
-        and user payload at [32:].
-
-        Returns (io_type, user_payload_bytes).
+        Optimized to handle the flood of status updates from the camera.
         """
         start = time.time()
         pkt_idx = 0
         while time.time() - start < timeout:
-            res = self.transport.recv_session_data(timeout=1.0)
+            res = self.transport.recv_session_data(timeout=0.1)
             if not res:
                 continue
 
             msg_type, full_decoded = res
             pkt_idx += 1
-            _LOGGER.debug(
-                f"recv_ioctrl [{pkt_idx}] type={msg_type.hex()} "
-                f"len={len(full_decoded)} expecting=0x{expected_type:04x}"
-            )
 
-            if msg_type != b'\x1d\x0a' or len(full_decoded) < 56:
+            if msg_type != b'\x1d\x0a' or len(full_decoded) < 60:
                 continue
 
+            # Skip the 28-byte session header to get to the AV payload
             data = full_decoded[28:]
-            if len(data) < 32:
+            if data[0:4] != b'\x00\x70\x0b\x00':
                 continue
 
+            # io_type is at offset 28 into the AV payload
             io_type = struct.unpack("<I", data[28:32])[0]
             user_payload = data[32:]
 
             if expected_type == 0 or io_type == expected_type:
-                _LOGGER.debug(f"recv_ioctrl type=0x{io_type:04x}")
+                _LOGGER.debug(f"recv_ioctrl type=0x{io_type:04x} FOUND at idx {pkt_idx}")
                 return io_type, user_payload
             else:
-                _LOGGER.debug(
-                    f"recv_ioctrl [{pkt_idx}] SKIP io=0x{io_type:04x} "
-                    f"(want 0x{expected_type:04x}) data[0:8]={data[0:8].hex()}"
-                )
+                # Log status updates (0x1101) only occasionally to prevent logging flood
+                if pkt_idx % 50 == 0 or io_type != 0x1101:
+                    _LOGGER.debug(
+                        f"recv_ioctrl [{pkt_idx}] SKIP io=0x{io_type:04x} "
+                        f"(want 0x{expected_type:04x})"
+                    )
 
         raise TutkTimeoutError(
             f"IOCtrl response timeout (expected 0x{expected_type:04x})"
@@ -758,6 +821,9 @@ class TutkClient:
 
     def connect(self, timeout: float = 10.0) -> bool:
         """Discover device on LAN, establish session, authenticate."""
+        if self.transport and self.transport._connected:
+            return True
+            
         _LOGGER.info(f"Connecting to {self.uid}...")
 
         res = self.transport.discover_lan_device(
@@ -794,6 +860,16 @@ class TutkClient:
                 self.admin_id, self.admin_pwd, timeout=10.0):
             raise TutkConnectionError("AV auth failed")
 
+    def _get_msg_id(self) -> int:
+        now = int(time.time())
+        if not hasattr(self, "_last_msg_id"):
+            self._last_msg_id = now
+        elif now <= self._last_msg_id:
+            self._last_msg_id += 1
+        else:
+            self._last_msg_id = now
+        return self._last_msg_id
+
     def get_night_light_status(self) -> bool:
         """
         Get the current night light status.
@@ -808,8 +884,10 @@ class TutkClient:
             # Drain the network buffer of old status streams before sending a request
             self.transport.drain()
 
-            msg_id = int(time.time())
-            payload = struct.pack("<ii", msg_id, 0)
+            msg_id = self._get_msg_id()
+            # GET payload is 8 bytes: msg_id (4) + logic/padding (4)
+            # Trace shows 22 1a 22 1a as the logic portion.
+            payload = struct.pack("<ii", msg_id, 0x1a221a22)
             self.av_channel.send_ioctrl(
                 IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_REQ, payload
             )
@@ -843,22 +921,34 @@ class TutkClient:
             self.transport.drain()
 
             on_off = 1 if state else 0
-            msg_id = int(time.time())
+            msg_id = self._get_msg_id()
+            # SET payload is 12 bytes: msg_id (4) + on_off (4) + logic/padding (4)
             payload = struct.pack("<iii", msg_id, on_off, 0)
-            self.av_channel.send_ioctrl(
-                IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_REQ, payload
-            )
-            # Wait for 0x1103 SET response (confirmation)
-            try:
-                io_type, resp = self.av_channel.recv_ioctrl(
-                    IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_RESP,
-                    timeout=15.0
+
+            # The camera often ignores the first SET command or is busy with status updates.
+            # Retry up to 3 times to ensure the command is accepted.
+            for attempt in range(1, 4):
+                _LOGGER.info(f"Setting night light to {'ON' if state else 'OFF'} (attempt {attempt})...")
+                self.av_channel.send_ioctrl(
+                    IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_REQ, payload
                 )
-                _LOGGER.info(f"SET response received: {resp.hex()}")
-                return True
-            except TutkTimeoutError:
-                _LOGGER.warning("No SET response received, command may still have worked")
-                return True  # SET was sent, assume it worked
+                
+                try:
+                    # Wait for 0x1103 SET response (confirmation)
+                    # We use a shorter timeout for retries to keep it responsive
+                    self.av_channel.recv_ioctrl(IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_RESP, timeout=3.0)
+                    _LOGGER.info(f"SET confirmation (0x1103) received on attempt {attempt}")
+                    return True
+                except TutkTimeoutError:
+                    if attempt < 3:
+                        _LOGGER.warning(f"No SET response on attempt {attempt}, retrying...")
+                        time.sleep(1.0)
+                        self.transport.drain()
+                        continue
+                    else:
+                        _LOGGER.error("No SET response received after 3 attempts")
+                        return False 
+
         except Exception as e:
             _LOGGER.error(f"Error setting nightlight: {e}")
         return False
