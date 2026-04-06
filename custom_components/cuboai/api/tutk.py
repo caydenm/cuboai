@@ -647,7 +647,7 @@ class AVChannel:
         struct.pack_into("<H", av_header, 4, self._av_seq)
         av_header[6:8] = b'\x59\x46'
         # Channel flags: 00 70 XX 00 where XX tracks write phase
-        av_header[8:12] = struct.pack("<I", 0x00007000 | ((self._write_counter & 0xFF) << 8))
+        av_header[8:12] = struct.pack("<I", 0x00007000 | ((self._write_counter & 0xFF) << 16))
         struct.pack_into("<I", av_header, 12, 1)   # action = 1
         struct.pack_into("<I", av_header, 16, inner_len)
         struct.pack_into("<I", av_header, 20, self._write_counter)
