@@ -117,21 +117,22 @@ class TutkTransport:
         """
         Broadcast a LAN search for the device.
         Returns (ip, port, punch_out_bytes) or None.
+
+        Tries broadcast first, then falls back to unicast scanning
+        of local subnets (needed for Docker/HAOS containers where
+        broadcast packets don't reach the physical LAN).
         """
         _LOGGER.debug(f"LAN search for UID: {uid}")
         sock = self._ensure_socket()
-        sock.settimeout(timeout)
 
         search_pkt = self._build_lan_search_packet(uid)
 
+        # Gather broadcast + unicast targets
+        targets = self._get_discovery_targets()
+
         try:
-            broadcast_addrs = [
-                ('255.255.255.255', TUTK_LAN_SEARCH_PORT),
-                ('192.168.1.255', TUTK_LAN_SEARCH_PORT),
-                ('192.168.0.255', TUTK_LAN_SEARCH_PORT),
-                ('10.0.0.255', TUTK_LAN_SEARCH_PORT),
-            ]
-            for addr in broadcast_addrs:
+            # Send to all targets
+            for addr in targets:
                 try:
                     sock.sendto(search_pkt, addr)
                 except Exception:
@@ -140,6 +141,7 @@ class TutkTransport:
             start = time.time()
             while time.time() - start < timeout:
                 try:
+                    sock.settimeout(max(0.5, timeout - (time.time() - start)))
                     data, addr = sock.recvfrom(2048)
                     res = self._parse_lan_search_response(data)
                     if res:
@@ -147,16 +149,74 @@ class TutkTransport:
                         _LOGGER.info(f"Discovered device {found_uid} at {addr[0]}:{addr[1]}")
                         return (addr[0], addr[1], punch_out)
                 except socket.timeout:
-                    # Re-send search
-                    for baddr in broadcast_addrs:
+                    # Re-send to all targets
+                    for tgt in targets:
                         try:
-                            sock.sendto(search_pkt, baddr)
+                            sock.sendto(search_pkt, tgt)
                         except Exception:
                             pass
                     continue
         except Exception as e:
             _LOGGER.error(f"LAN discovery error: {e}")
         return None
+
+    def _get_discovery_targets(self):
+        """
+        Build a list of (ip, port) tuples to send discovery packets to.
+        Includes broadcast addresses and unicast to every host on local /24 subnets.
+        """
+        targets = [
+            ('255.255.255.255', TUTK_LAN_SEARCH_PORT),
+        ]
+
+        # Detect local network interfaces to find subnet broadcast + unicast targets
+        try:
+            import fcntl
+            import array
+
+            # Get list of network interfaces via ioctl
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            max_interfaces = 32
+            buf = array.array('B', b'\0' * max_interfaces * 40)
+            try:
+                import struct as _struct
+                result = fcntl.ioctl(s.fileno(), 0x8912,  # SIOCGIFCONF
+                                     _struct.pack('iL', max_interfaces * 40, buf.buffer_info()[0]))
+                result_len = _struct.unpack('iL', result)[0]
+                data = buf.tobytes()[:result_len]
+
+                offset = 0
+                while offset < len(data):
+                    iface_name = data[offset:offset+16].split(b'\0', 1)[0].decode('ascii', errors='ignore')
+                    ip_bytes = data[offset+20:offset+24]
+                    ip_addr = socket.inet_ntoa(ip_bytes)
+                    offset += 40
+
+                    if ip_addr.startswith('127.') or ip_addr == '0.0.0.0':
+                        continue
+
+                    # Add subnet broadcast
+                    parts = ip_addr.split('.')
+                    subnet_broadcast = f"{parts[0]}.{parts[1]}.{parts[2]}.255"
+                    targets.append((subnet_broadcast, TUTK_LAN_SEARCH_PORT))
+
+                    # Add unicast for every host on the /24 subnet
+                    prefix = f"{parts[0]}.{parts[1]}.{parts[2]}"
+                    for host in range(1, 255):
+                        targets.append((f"{prefix}.{host}", TUTK_LAN_SEARCH_PORT))
+
+                    _LOGGER.debug(f"Discovery: scanning subnet {prefix}.0/24 via {iface_name} ({ip_addr})")
+            finally:
+                s.close()
+        except Exception as e:
+            _LOGGER.debug(f"Interface detection failed ({e}), using fallback subnets")
+            # Fallback: common home subnets
+            for prefix in ['192.168.1', '192.168.0', '10.0.0', '172.16.0']:
+                targets.append((f"{prefix}.255", TUTK_LAN_SEARCH_PORT))
+                for host in range(1, 255):
+                    targets.append((f"{prefix}.{host}", TUTK_LAN_SEARCH_PORT))
+
+        return targets
 
     def _build_lan_search_packet(self, uid: str) -> bytes:
         """
