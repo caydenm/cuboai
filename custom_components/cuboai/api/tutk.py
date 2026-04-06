@@ -184,10 +184,11 @@ class TutkTransport:
                     if len(fields) >= 3 and fields[1] != '00000000':
                         continue
                     if len(fields) >= 3 and fields[1] == '00000000':
-                        # Default route found — get gateway IP
+                        # Default route found — get gateway IP (Little-Endian hex)
                         gw_hex = fields[2]
+                        # Correct Little-Endian parse: "0101A8C0" -> "192.168.1.1"
                         gw_ip = '.'.join(str(int(gw_hex[i:i+2], 16))
-                                         for i in range(0, 8, 2))
+                                         for i in range(6, -1, -2))
                         parts = gw_ip.split('.')
                         prefix = f"{parts[0]}.{parts[1]}.{parts[2]}"
                         if prefix not in scanned_prefixes:
@@ -819,21 +820,24 @@ class TutkClient:
         self.transport: TutkTransport = TutkTransport()
         self.av_channel: Optional[AVChannel] = None
 
-    def connect(self, timeout: float = 10.0) -> bool:
-        """Discover device on LAN, establish session, authenticate."""
+    def connect(self, timeout: float = 10.0, ip: Optional[str] = None) -> bool:
+        """Discover device on LAN (or use direct IP), establish session, authenticate."""
         if self.transport and self.transport._connected:
             return True
-            
-        _LOGGER.info(f"Connecting to {self.uid}...")
 
-        res = self.transport.discover_lan_device(
-            self.license_id, timeout=min(5.0, timeout)
-        )
-        if not res:
-            _LOGGER.error("Device not found on LAN")
-            return False
-
-        ip, port, punch_out = res
+        if ip:
+            _LOGGER.info(f"Connecting to {self.uid} at {ip} (direct)...")
+            punch_out = b"" # No punch_out needed for direct LAN
+            port = TUTK_DEVICE_PORT
+        else:
+            _LOGGER.info(f"Connecting to {self.uid} (discovery)...")
+            res = self.transport.discover_lan_device(
+                self.license_id, timeout=min(5.0, timeout)
+            )
+            if not res:
+                _LOGGER.error("Device not found on LAN")
+                return False
+            ip, port, punch_out = res
         if not self.transport.connect_lan(ip, port, self.license_id, punch_out):
             _LOGGER.error("Handshake failed")
             return False
