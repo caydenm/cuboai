@@ -118,16 +118,15 @@ class TutkTransport:
 
     # ── LAN Discovery ──
 
-    def discover_lan_device(self, uid: str, timeout: float = 5.0):
+    def discover_lan_device(self, uid: str, timeout: float = 10.0):
         """
         Broadcast a LAN search for the device.
         Returns (ip, port, punch_out_bytes) or None.
 
-        Tries broadcast first, then falls back to unicast scanning
-        of local subnets (needed for Docker/HAOS containers where
-        broadcast packets don't reach the physical LAN).
+        Sends to broadcast addresses and unicast-scans all detected
+        subnets. Includes extensive logging for HAOS debugging.
         """
-        _LOGGER.debug(f"LAN search for UID: {uid}")
+        _LOGGER.info(f"LAN search for UID: {uid} (timeout={timeout}s)")
         sock = self._ensure_socket()
 
         search_pkt = self._build_lan_search_packet(uid)
@@ -135,25 +134,39 @@ class TutkTransport:
         # Gather broadcast + unicast targets
         targets = self._get_discovery_targets()
 
+        recv_count = 0
         try:
             # Send to all targets
+            sent = 0
             for addr in targets:
                 try:
                     sock.sendto(search_pkt, addr)
+                    sent += 1
                 except Exception:
                     pass
+            _LOGGER.info(f"Discovery: sent search packet to {sent}/{len(targets)} targets")
 
             start = time.time()
             while time.time() - start < timeout:
                 try:
                     sock.settimeout(max(0.5, timeout - (time.time() - start)))
                     data, addr = sock.recvfrom(2048)
+                    recv_count += 1
                     res = self._parse_lan_search_response(data)
                     if res:
                         found_uid, punch_out = res
                         _LOGGER.info(f"Discovered device {found_uid} at {addr[0]}:{addr[1]}")
                         return (addr[0], addr[1], punch_out)
+                    else:
+                        # Log non-matching packets to help debug
+                        decoded = self._deobfuscate(data)
+                        _LOGGER.debug(
+                            f"Discovery: got {len(data)}B from {addr[0]}:{addr[1]} "
+                            f"(decoded magic={decoded[0:4].hex()}, not a match)"
+                        )
                 except socket.timeout:
+                    elapsed = time.time() - start
+                    _LOGGER.debug(f"Discovery: no reply after {elapsed:.1f}s, resending...")
                     # Re-send to all targets
                     for tgt in targets:
                         try:
@@ -163,42 +176,83 @@ class TutkTransport:
                     continue
         except Exception as e:
             _LOGGER.error(f"LAN discovery error: {e}")
+
+        _LOGGER.warning(
+            f"Discovery: device not found after {timeout}s "
+            f"(received {recv_count} packets, none matched)"
+        )
         return None
 
     def _get_discovery_targets(self):
         """
         Build a list of (ip, port) tuples to send discovery packets to.
-        Detects local subnet via /proc/net/route or socket trick,
-        then sends broadcast + unicast to every host on /24.
+        Enumerates ALL connected subnets from multiple sources.
         """
         targets = [
             ('255.255.255.255', TUTK_LAN_SEARCH_PORT),
         ]
         scanned_prefixes = set()
 
-        # Method 1: Read default gateway from /proc/net/route (Linux)
+        # Method 1: Read ALL subnets from /proc/net/route (not just default gw)
         try:
             with open('/proc/net/route', 'r') as f:
                 for line in f.readlines()[1:]:
                     fields = line.strip().split()
-                    if len(fields) >= 3 and fields[1] != '00000000':
+                    if len(fields) < 8:
                         continue
-                    if len(fields) >= 3 and fields[1] == '00000000':
-                        # Default route found — get gateway IP (Little-Endian hex)
-                        gw_hex = fields[2]
-                        # Correct Little-Endian parse: "0101A8C0" -> "192.168.1.1"
+                    iface = fields[0]
+                    dest_hex = fields[1]
+                    gw_hex = fields[2]
+                    mask_hex = fields[7]
+
+                    # Parse the destination network (Little-Endian hex)
+                    dest_ip = '.'.join(str(int(dest_hex[i:i+2], 16))
+                                       for i in range(6, -1, -2))
+
+                    # For default route (dest=0.0.0.0), use the gateway IP
+                    if dest_hex == '00000000' and gw_hex != '00000000':
                         gw_ip = '.'.join(str(int(gw_hex[i:i+2], 16))
                                          for i in range(6, -1, -2))
                         parts = gw_ip.split('.')
                         prefix = f"{parts[0]}.{parts[1]}.{parts[2]}"
                         if prefix not in scanned_prefixes:
                             scanned_prefixes.add(prefix)
-                            _LOGGER.debug(f"Discovery: gateway subnet {prefix}.0/24")
-                        break
-        except Exception:
-            pass
+                            _LOGGER.info(f"Discovery: default gw subnet {prefix}.0/24 ({iface})")
 
-        # Method 2: Connect to a public IP to find our local address
+                    # For connected subnets (non-zero dest), use the destination
+                    elif dest_hex != '00000000':
+                        parts = dest_ip.split('.')
+                        prefix = f"{parts[0]}.{parts[1]}.{parts[2]}"
+                        # Skip loopback and link-local
+                        if parts[0] in ('127', '169'):
+                            continue
+                        if prefix not in scanned_prefixes:
+                            scanned_prefixes.add(prefix)
+                            _LOGGER.info(f"Discovery: connected subnet {prefix}.0/24 ({iface})")
+
+        except Exception as e:
+            _LOGGER.warning(f"Discovery: failed to read /proc/net/route: {e}")
+
+        # Method 2: Enumerate all interface IPs
+        try:
+            # Try using netifaces if available
+            import netifaces
+            for iface in netifaces.interfaces():
+                addrs = netifaces.ifaddresses(iface)
+                for addr_info in addrs.get(netifaces.AF_INET, []):
+                    ip = addr_info.get('addr', '')
+                    parts = ip.split('.')
+                    if len(parts) == 4 and parts[0] not in ('127', '169'):
+                        prefix = f"{parts[0]}.{parts[1]}.{parts[2]}"
+                        if prefix not in scanned_prefixes:
+                            scanned_prefixes.add(prefix)
+                            _LOGGER.info(f"Discovery: interface {iface} subnet {prefix}.0/24")
+        except ImportError:
+            pass
+        except Exception as e:
+            _LOGGER.debug(f"Discovery: netifaces scan failed: {e}")
+
+        # Method 3: Socket probe to find default outbound IP
         try:
             probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             probe.settimeout(0)
@@ -209,16 +263,40 @@ class TutkTransport:
                 prefix = f"{parts[0]}.{parts[1]}.{parts[2]}"
                 if prefix not in scanned_prefixes:
                     scanned_prefixes.add(prefix)
-                    _LOGGER.debug(f"Discovery: local subnet {prefix}.0/24")
+                    _LOGGER.info(f"Discovery: outbound IP subnet {prefix}.0/24")
             finally:
                 probe.close()
         except Exception:
             pass
 
-        # Fallback if nothing detected
-        if not scanned_prefixes:
-            for prefix in ['192.168.1', '192.168.0', '10.0.0']:
+        # Method 4: Parse 'ip addr' output as last resort
+        try:
+            import subprocess
+            result = subprocess.run(
+                ['ip', '-4', '-o', 'addr', 'show'],
+                capture_output=True, text=True, timeout=3
+            )
+            for line in result.stdout.splitlines():
+                # Format: "2: eth0    inet 192.168.1.100/24 ..."
+                parts_line = line.split()
+                for i, token in enumerate(parts_line):
+                    if token == 'inet' and i + 1 < len(parts_line):
+                        ip_cidr = parts_line[i + 1]
+                        ip = ip_cidr.split('/')[0]
+                        parts = ip.split('.')
+                        if len(parts) == 4 and parts[0] not in ('127', '169'):
+                            prefix = f"{parts[0]}.{parts[1]}.{parts[2]}"
+                            if prefix not in scanned_prefixes:
+                                scanned_prefixes.add(prefix)
+                                _LOGGER.info(f"Discovery: ip-addr subnet {prefix}.0/24")
+        except Exception as e:
+            _LOGGER.debug(f"Discovery: 'ip addr' fallback failed: {e}")
+
+        # Always include common home subnets as fallback
+        for prefix in ['192.168.1', '192.168.0', '192.168.2', '10.0.0', '10.0.1']:
+            if prefix not in scanned_prefixes:
                 scanned_prefixes.add(prefix)
+                _LOGGER.debug(f"Discovery: adding common subnet {prefix}.0/24")
 
         # Build target list: broadcast + unicast for each subnet
         for prefix in scanned_prefixes:
@@ -226,8 +304,11 @@ class TutkTransport:
             for host in range(1, 255):
                 targets.append((f"{prefix}.{host}", TUTK_LAN_SEARCH_PORT))
 
-        _LOGGER.info(f"Discovery: scanning {len(scanned_prefixes)} subnet(s), "
-                     f"{len(targets)} targets")
+        _LOGGER.info(
+            f"Discovery: scanning {len(scanned_prefixes)} subnet(s): "
+            f"{', '.join(sorted(scanned_prefixes))} "
+            f"({len(targets)} targets)"
+        )
         return targets
 
     def _build_lan_search_packet(self, uid: str) -> bytes:
@@ -834,7 +915,7 @@ class TutkClient:
         else:
             _LOGGER.info(f"Connecting to {self.uid} (discovery)...")
             res = self.transport.discover_lan_device(
-                self.license_id, timeout=min(5.0, timeout)
+                self.license_id, timeout=min(10.0, timeout)
             )
             if not res:
                 _LOGGER.error("Device not found on LAN")

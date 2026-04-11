@@ -137,10 +137,10 @@ class CuboNightLight(LightEntity):
                     raise
 
             loop = asyncio.get_running_loop()
-            # Hard cap at 20 s so we never block the executor indefinitely
+            # Hard cap at 30 s to accommodate discovery (10s) + handshake + auth
             return await asyncio.wait_for(
                 loop.run_in_executor(None, _run),
-                timeout=20.0,
+                timeout=30.0,
             )
 
     async def async_turn_on(self, **kwargs):
