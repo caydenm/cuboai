@@ -98,14 +98,22 @@ class TutkTransport:
         self._alive_thread: Optional[threading.Thread] = None
         # Random 8-byte token generated during connect
         self._random_token: bytes = b'\x00' * 8
+        self._keepalive_paused: bool = False
 
     def _ensure_socket(self) -> socket.socket:
         if self.sock is None:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Help with discovery in containerized environments (HAOS/Docker)
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, 'SO_REUSEPORT'):
+                    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except Exception:
+                pass
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             self.sock.settimeout(2.0)
             self.sock.bind(('', 0))
-            _LOGGER.info(f"Socket bound to local port {self.sock.getsockname()[1]}")
+            _LOGGER.debug(f"Socket bound to local port {self.sock.getsockname()[1]}")
         return self.sock
 
     # ── Obfuscation ──
@@ -148,8 +156,10 @@ class TutkTransport:
 
             start = time.time()
             while time.time() - start < timeout:
+                if not self.sock:
+                    break
                 try:
-                    sock.settimeout(max(0.5, timeout - (time.time() - start)))
+                    sock.settimeout(max(0.1, min(1.0, timeout - (time.time() - start))))
                     data, addr = sock.recvfrom(2048)
                     recv_count += 1
                     res = self._parse_lan_search_response(data)
@@ -164,16 +174,24 @@ class TutkTransport:
                             f"Discovery: got {len(data)}B from {addr[0]}:{addr[1]} "
                             f"(decoded magic={decoded[0:4].hex()}, not a match)"
                         )
-                except socket.timeout:
-                    elapsed = time.time() - start
-                    _LOGGER.debug(f"Discovery: no reply after {elapsed:.1f}s, resending...")
-                    # Re-send to all targets
+                except (socket.timeout, BlockingIOError):
+                    if not self.sock:
+                        break
+                    # Re-send to all targets to keep poking
                     for tgt in targets:
                         try:
                             sock.sendto(search_pkt, tgt)
-                        except Exception:
+                        except (socket.error, socket.timeout):
                             pass
                     continue
+                except socket.error as se:
+                    # Catch Errno 9 (Bad file descriptor) which happens if 
+                    # another thread calls close() while we are in recvfrom.
+                    if se.errno == 9:
+                        _LOGGER.debug("Discovery socket closed concurrently")
+                    else:
+                        _LOGGER.error(f"Discovery socket error: {se}")
+                    break
         except Exception as e:
             _LOGGER.error(f"LAN discovery error: {e}")
 
@@ -451,6 +469,8 @@ class TutkTransport:
         while not self._stop_event.wait(10.0):
             if not self._connected or not self.sock:
                 break
+            if self._keepalive_paused:
+                continue
             try:
                 keep = bytearray(24)
                 keep[0:4] = b'\x04\x02\x1a\x02'
@@ -562,6 +582,7 @@ class TutkTransport:
                 # without session-level acknowledgments)
                 if msg_type == b'\x1d\x0a' and len(decoded) >= 8:
                     recv_seq = struct.unpack('<H', decoded[6:8])[0]
+                    # Direct ACK sending to avoid framing overhead
                     self._send_session_ack(recv_seq)
 
                 return msg_type, decoded
@@ -575,19 +596,23 @@ class TutkTransport:
     def _send_session_ack(self, acked_seq: int):
         """
         Send a session-level ACK (0x0900) for the given received sequence.
-        Required by the TUTK reliable delivery layer — the camera won't
-        process write commands (SET) until it knows its data is being received.
+        Required by the TUTK reliable delivery layer.
         """
+        if not self.sock:
+            return
+        
+        # Audio-style ACK (Magic 09 00 0b 00)
         ack_data = bytearray(24)
         ack_data[0:2] = b'\x09\x00'       # ACK magic
         ack_data[2:4] = b'\x0b\x00'       # channel
-        struct.pack_into('<I', ack_data, 4, acked_seq)
-        ack_data[8:12] = b'\xff\xff\xff\xff'
-        # [12:24] = zeros (recv count, channel data, trailer)
+        struct.pack_into("<H", ack_data, 4, acked_seq)  # 16-bit seq
+        ack_data[6:12] = b'\x00\x00\xff\xff\xff\xff'
+        
+        # Send wrapped in a session frame (1a 0a)
         try:
             self.send_session_data(bytes(ack_data), magic=b'\x1a\x0a')
         except Exception:
-            pass  # Best-effort ACK
+            pass
 
     def close(self):
         self._connected = False
@@ -1001,52 +1026,50 @@ class TutkClient:
     def set_night_light_status(self, state: bool) -> bool:
         """
         Set the night light on or off.
-
-        Sends IOType 0x1102 (SET_NIGHT_LIGHT_ON_OFF_REQ) with 12-byte
-        payload (msg_id + on_off + reserved).
         """
         if not self.av_channel:
             return False
+        
+        # Every command needs a unique message ID (epoch timestamp)
+        msg_id = int(time.time())
+        on_off = 1 if state else 0
+        payload = struct.pack("<iii", msg_id, on_off, 0)
+        
         try:
-            # Pause keepalive to prevent traffic noise during command
-            self.av_channel._stop_keepalive()
-            # Drain the network buffer
-            self.transport.drain()
-
-            on_off = 1 if state else 0
-            msg_id = self._get_msg_id()
-            payload = struct.pack("<iii", msg_id, on_off, 0)
-
+            # Silence background keepalives during SET attempt
+            self.transport._keepalive_paused = True
+            
             for attempt in range(1, 4):
                 _LOGGER.info(f"Setting night light to {'ON' if state else 'OFF'} (attempt {attempt})...")
+                
+                # Clear stale status packets before sending
+                self.transport.drain()
+                
                 self.av_channel.send_ioctrl(
                     IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_REQ, payload
                 )
-
+                
                 try:
-                    self.av_channel.recv_ioctrl(IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_RESP, timeout=3.0)
+                    # Wait for 0x1103 confirmation
+                    self.av_channel.recv_ioctrl(IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_RESP, timeout=5.0)
                     _LOGGER.info(f"SET confirmation (0x1103) received on attempt {attempt}")
-                    # Drain the 0x1103 flood that follows a state change
-                    # before allowing keepalive or GET to resume
-                    time.sleep(0.5)
+                    
+                    # MANDATORY: Settle delay. Camera floods 1101s after a change.
+                    time.sleep(1.0)
                     self.transport.drain()
                     return True
                 except TutkTimeoutError:
                     if attempt < 3:
                         _LOGGER.warning(f"No SET response on attempt {attempt}, retrying...")
                         time.sleep(1.0)
-                        self.transport.drain()
                         continue
                     else:
                         _LOGGER.error("No SET response received after 3 attempts")
                         return False
-
         except Exception as e:
             _LOGGER.error(f"Error setting nightlight: {e}")
         finally:
-            # Always restart keepalive
-            if self.av_channel:
-                self.av_channel._start_keepalive()
+            self.transport._keepalive_paused = False
         return False
 
     def disconnect(self):
