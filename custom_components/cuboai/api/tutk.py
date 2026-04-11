@@ -642,38 +642,41 @@ class AVChannel:
 
     def _start_keepalive(self):
         """Start background thread pumping fake A/V dummy frames."""
-        import threading
-        if hasattr(self, "_keep_alive_running") and self._keepalive_running:
+        if getattr(self, "_keepalive_running", False):
             return
-            
+
         self._keepalive_running = True
         self._keepalive_thread = threading.Thread(target=self._keepalive_loop, daemon=True)
         self._keepalive_thread.start()
 
-    def _keepalive_loop(self):
-        import struct
-        import time
-        # Send a mixture of dummy audio/video packets every 50ms (simulating 20fps)
-        while getattr(self, "_keepalive_running", False):
-            # Send Dummy Audio (codec 0x09)
-            # Trace: 09 00 0b 00 {seq} 00 05 00 ff ff ff ff 00 00 00 00 00 00 00 00 22 1a fd 76
-            d1 = bytearray(bytes.fromhex("09000b0000000500ffffffff0000000000000000221afd76"))
-            # Send Dummy Video (codec 0x0a)
-            # Trace: 0a 08 0b 00 {seq} 00 05 00 df 6c 32 00 00 00 00 00
-            d2 = bytearray(bytes.fromhex("0a080b0000000500df6c320000000000"))
-            
-            with self._av_seq_lock:
-                # 09 packet
-                struct.pack_into("<H", d1, 4, self._av_seq)
-                self._av_seq += 1
-                self.transport.send_session_data(d1)
-                
-                # 0a packet
-                struct.pack_into("<H", d2, 4, self._av_seq)
-                self._av_seq += 1
-                self.transport.send_session_data(d2)
+    def _stop_keepalive(self):
+        """Stop the keepalive background thread."""
+        self._keepalive_running = False
+        if hasattr(self, "_keepalive_thread") and self._keepalive_thread:
+            self._keepalive_thread.join(timeout=2)
+            self._keepalive_thread = None
 
-            time.sleep(0.05)
+    def _keepalive_loop(self):
+        """Send dummy A/V frames to keep the control tunnel alive."""
+        # 500ms interval is sufficient to keep the session alive
+        # without flooding the network (was 50ms = 20 pkt/s)
+        while getattr(self, "_keepalive_running", False):
+            try:
+                d1 = bytearray(bytes.fromhex("09000b0000000500ffffffff0000000000000000221afd76"))
+                d2 = bytearray(bytes.fromhex("0a080b0000000500df6c320000000000"))
+
+                with self._av_seq_lock:
+                    struct.pack_into("<H", d1, 4, self._av_seq)
+                    self._av_seq += 1
+                    self.transport.send_session_data(d1)
+
+                    struct.pack_into("<H", d2, 4, self._av_seq)
+                    self._av_seq += 1
+                    self.transport.send_session_data(d2)
+            except Exception:
+                break  # Transport closed, exit gracefully
+
+            time.sleep(0.5)
         raw = bytearray(52)
         raw[0:4] = b'\x04\x02\x1a\x02'
         raw[4:8] = struct.pack("<I", 36)
@@ -755,7 +758,6 @@ class AVChannel:
             with self._av_seq_lock:
                 self._av_seq = seq_to_use + 4
         else:
-            _LOGGER.info(f"Captured Token: {self._auth_token.hex()}")
             _LOGGER.debug(f"send_ioctrl type=0x{io_type:04x} seq={seq_to_use}")
             self.transport.send_session_data(full_payload, magic=b'\x1a\x0a')
 
@@ -885,18 +887,18 @@ class TutkClient:
         if not self.av_channel:
             return False
         try:
-            # Drain the network buffer of old status streams before sending a request
+            # Pause keepalive to prevent traffic noise during command
+            self.av_channel._stop_keepalive()
+            # Drain the network buffer of old status streams
             self.transport.drain()
 
             msg_id = self._get_msg_id()
-            # GET payload is 8 bytes: msg_id (4) + logic/padding (4)
-            # Trace shows 22 1a 22 1a as the logic portion.
             payload = struct.pack("<ii", msg_id, 0x1a221a22)
             self.av_channel.send_ioctrl(
                 IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_REQ, payload
             )
             io_type, resp = self.av_channel.recv_ioctrl(
-                IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_RESP, 
+                IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_RESP,
                 timeout=5.0
             )
             _LOGGER.debug(f"GET resp ({len(resp)} bytes): {resp.hex()}")
@@ -909,6 +911,10 @@ class TutkClient:
                 return on_off == 1
         except Exception as e:
             _LOGGER.error(f"Error getting nightlight: {e}")
+        finally:
+            # Always restart keepalive
+            if self.av_channel:
+                self.av_channel._start_keepalive()
         return False
 
     def set_night_light_status(self, state: bool) -> bool:
@@ -921,27 +927,28 @@ class TutkClient:
         if not self.av_channel:
             return False
         try:
-            # Drain the network buffer of old status streams before sending a request
+            # Pause keepalive to prevent traffic noise during command
+            self.av_channel._stop_keepalive()
+            # Drain the network buffer
             self.transport.drain()
 
             on_off = 1 if state else 0
             msg_id = self._get_msg_id()
-            # SET payload is 12 bytes: msg_id (4) + on_off (4) + logic/padding (4)
             payload = struct.pack("<iii", msg_id, on_off, 0)
 
-            # The camera often ignores the first SET command or is busy with status updates.
-            # Retry up to 3 times to ensure the command is accepted.
             for attempt in range(1, 4):
                 _LOGGER.info(f"Setting night light to {'ON' if state else 'OFF'} (attempt {attempt})...")
                 self.av_channel.send_ioctrl(
                     IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_REQ, payload
                 )
-                
+
                 try:
-                    # Wait for 0x1103 SET response (confirmation)
-                    # We use a shorter timeout for retries to keep it responsive
                     self.av_channel.recv_ioctrl(IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_RESP, timeout=3.0)
                     _LOGGER.info(f"SET confirmation (0x1103) received on attempt {attempt}")
+                    # Drain the 0x1103 flood that follows a state change
+                    # before allowing keepalive or GET to resume
+                    time.sleep(0.5)
+                    self.transport.drain()
                     return True
                 except TutkTimeoutError:
                     if attempt < 3:
@@ -951,14 +958,20 @@ class TutkClient:
                         continue
                     else:
                         _LOGGER.error("No SET response received after 3 attempts")
-                        return False 
+                        return False
 
         except Exception as e:
             _LOGGER.error(f"Error setting nightlight: {e}")
+        finally:
+            # Always restart keepalive
+            if self.av_channel:
+                self.av_channel._start_keepalive()
         return False
 
     def disconnect(self):
+        """Disconnect and clean up all threads."""
         _LOGGER.info("Disconnecting")
         if self.av_channel:
+            self.av_channel._stop_keepalive()
             self.av_channel = None
         self.transport.close()
