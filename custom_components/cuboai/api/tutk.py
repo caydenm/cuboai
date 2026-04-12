@@ -98,14 +98,24 @@ class TutkTransport:
         self._alive_thread: Optional[threading.Thread] = None
         # Random 8-byte token generated during connect
         self._random_token: bytes = b'\x00' * 8
+        self._keepalive_paused: bool = False
+        self._last_set_time: float = 0
+        self._last_set_state: bool = False
 
     def _ensure_socket(self) -> socket.socket:
         if self.sock is None:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            # Help with discovery in containerized environments (HAOS/Docker)
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if hasattr(socket, 'SO_REUSEPORT'):
+                    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except Exception:
+                pass
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             self.sock.settimeout(2.0)
             self.sock.bind(('', 0))
-            _LOGGER.info(f"Socket bound to local port {self.sock.getsockname()[1]}")
+            _LOGGER.debug(f"Socket bound to local port {self.sock.getsockname()[1]}")
         return self.sock
 
     # ── Obfuscation ──
@@ -148,8 +158,10 @@ class TutkTransport:
 
             start = time.time()
             while time.time() - start < timeout:
+                if not self.sock:
+                    break
                 try:
-                    sock.settimeout(max(0.5, timeout - (time.time() - start)))
+                    sock.settimeout(max(0.1, min(1.0, timeout - (time.time() - start))))
                     data, addr = sock.recvfrom(2048)
                     recv_count += 1
                     res = self._parse_lan_search_response(data)
@@ -164,16 +176,24 @@ class TutkTransport:
                             f"Discovery: got {len(data)}B from {addr[0]}:{addr[1]} "
                             f"(decoded magic={decoded[0:4].hex()}, not a match)"
                         )
-                except socket.timeout:
-                    elapsed = time.time() - start
-                    _LOGGER.debug(f"Discovery: no reply after {elapsed:.1f}s, resending...")
-                    # Re-send to all targets
+                except (socket.timeout, BlockingIOError):
+                    if not self.sock:
+                        break
+                    # Re-send to all targets to keep poking
                     for tgt in targets:
                         try:
                             sock.sendto(search_pkt, tgt)
-                        except Exception:
+                        except (socket.error, socket.timeout):
                             pass
                     continue
+                except socket.error as se:
+                    # Catch Errno 9 (Bad file descriptor) which happens if 
+                    # another thread calls close() while we are in recvfrom.
+                    if se.errno == 9:
+                        _LOGGER.debug("Discovery socket closed concurrently")
+                    else:
+                        _LOGGER.error(f"Discovery socket error: {se}")
+                    break
         except Exception as e:
             _LOGGER.error(f"LAN discovery error: {e}")
 
@@ -451,6 +471,8 @@ class TutkTransport:
         while not self._stop_event.wait(10.0):
             if not self._connected or not self.sock:
                 break
+            if self._keepalive_paused:
+                continue
             try:
                 keep = bytearray(24)
                 keep[0:4] = b'\x04\x02\x1a\x02'
@@ -507,37 +529,36 @@ class TutkTransport:
         with self._lock:
             self.sock.sendto(frame, (self.device_ip, self.device_port))
         return 0
-    def drain(self):
+    def drain(self, max_duration: float = 1.0, silence_timeout: float = 0.2):
         """
-        Drain all pending packets from the UDP socket receive buffer.
-        Useful before sending a command to ensure we don't read stale
-        status updates that the camera was streaming.
+        Drain pending packets until silence is detected or max_duration reached.
         """
         if not self.sock:
             return
         
+        start = time.time()
+        count = 0
         try:
             with self._recv_lock:
                 orig_timeout = self.sock.gettimeout()
-                self.sock.settimeout(0.0)
-                try:
-                    count = 0
-                    while count < 10000:
+                while time.time() - start < max_duration:
+                    try:
+                        # Wait for a short burst of silence
+                        self.sock.settimeout(silence_timeout)
                         self.sock.recvfrom(4096)
                         count += 1
-                except (BlockingIOError, socket.error):
-                    # Buffer is empty
-                    pass
-                finally:
-                    self.sock.settimeout(orig_timeout)
+                        # If we got a packet, we reduce the silence window for the next one
+                        # to keep things moving fast.
+                        silence_timeout = min(silence_timeout, 0.05)
+                    except (BlockingIOError, socket.timeout):
+                        # Silence detected!
+                        break
+                self.sock.settimeout(orig_timeout)
         except Exception as e:
-            _LOGGER.debug(f"Drain error: {e}")
-    def recv_session_data(self, timeout: float = 5.0):
+            _LOGGER.debug(f"Drain error after {count} pkts: {e}")
+    def recv_session_data(self, timeout: float = 5.0, suppress_ack: bool = False):
         """
         Receive and deobfuscate a session packet.
-
-        Returns (magic_bytes, payload_after_context) or None on timeout.
-        The magic_bytes are pkt[2:4] which identify packet type.
         """
         start = time.time()
         while time.time() - start < timeout:
@@ -546,10 +567,19 @@ class TutkTransport:
                     break
                 with self._recv_lock:
                     remaining = timeout - (time.time() - start)
+                    # Use a zero timeout for the final check if time is up,
+                    # ensuring we catch any trailing packets.
                     if remaining <= 0:
-                        break
-                    self.sock.settimeout(min(1.0, remaining))
-                    data, addr = self.sock.recvfrom(2048)
+                        self.sock.settimeout(0.0)
+                    else:
+                        self.sock.settimeout(min(1.0, remaining))
+                    
+                    try:
+                        data, addr = self.sock.recvfrom(2048)
+                    except (BlockingIOError, socket.timeout):
+                        if remaining <= 0:
+                            break
+                        continue
 
                 if len(data) == 0:
                     continue
@@ -558,10 +588,11 @@ class TutkTransport:
                 msg_type = decoded[2:4]
 
                 # Auto-ACK received 1d0a data packets to maintain
-                # reliable delivery (camera won't process SET commands
-                # without session-level acknowledgments)
-                if msg_type == b'\x1d\x0a' and len(decoded) >= 8:
+                # reliable delivery. During floods, we can suppress this
+                # to prioritize receiving over sending.
+                if not suppress_ack and msg_type == b'\x1d\x0a' and len(decoded) >= 8:
                     recv_seq = struct.unpack('<H', decoded[6:8])[0]
+                    # Direct ACK sending to avoid framing overhead
                     self._send_session_ack(recv_seq)
 
                 return msg_type, decoded
@@ -575,19 +606,23 @@ class TutkTransport:
     def _send_session_ack(self, acked_seq: int):
         """
         Send a session-level ACK (0x0900) for the given received sequence.
-        Required by the TUTK reliable delivery layer — the camera won't
-        process write commands (SET) until it knows its data is being received.
+        Required by the TUTK reliable delivery layer.
         """
+        if not self.sock:
+            return
+        
+        # Audio-style ACK (Magic 09 00 0b 00)
         ack_data = bytearray(24)
         ack_data[0:2] = b'\x09\x00'       # ACK magic
         ack_data[2:4] = b'\x0b\x00'       # channel
-        struct.pack_into('<I', ack_data, 4, acked_seq)
-        ack_data[8:12] = b'\xff\xff\xff\xff'
-        # [12:24] = zeros (recv count, channel data, trailer)
+        struct.pack_into("<H", ack_data, 4, acked_seq)  # 16-bit seq
+        ack_data[6:12] = b'\x00\x00\xff\xff\xff\xff'
+        
+        # Send wrapped in a session frame (1a 0a)
         try:
             self.send_session_data(bytes(ack_data), magic=b'\x1a\x0a')
         except Exception:
-            pass  # Best-effort ACK
+            pass
 
     def close(self):
         self._connected = False
@@ -846,46 +881,77 @@ class AVChannel:
         return 0
 
     def recv_ioctrl(self, expected_type: int = 0,
-                    timeout: float = 5.0) -> Tuple[int, bytes]:
+                    timeout: float = 5.0,
+                    expected_msg_id: int = None) -> Tuple[int, bytes]:
         """
         Receive an IOCtrl response.
-        Optimized to handle the flood of status updates from the camera.
+        Optimized with batch-receive to withstand camera floods.
+        If expected_msg_id is provided, verifies it matches the first 4 bytes of payload.
         """
         start = time.time()
         pkt_idx = 0
         while time.time() - start < timeout:
-            res = self.transport.recv_session_data(timeout=0.1)
+            # Check for data with a tiny wait if the buffer is empty
+            res = self.transport.recv_session_data(timeout=0.01, suppress_ack=True)
             if not res:
                 continue
 
-            msg_type, full_decoded = res
-            pkt_idx += 1
+            # SLURP MODE: Once we find data, process ALL available packets 
+            # currently waiting in the OS kernel buffer in a single transaction.
+            # This drastically increases throughput during camera floods.
+            batch_pkts = [res]
+            try:
+                for _ in range(200): # Process up to 200 packets in a single burst
+                    nxt = self.transport.recv_session_data(timeout=0.0, suppress_ack=True)
+                    if not nxt:
+                        break
+                    batch_pkts.append(nxt)
+            except Exception:
+                pass
 
-            if msg_type != b'\x1d\x0a' or len(full_decoded) < 60:
-                continue
+            for msg_type, decoded in batch_pkts:
+                pkt_idx += 1
+                if msg_type != b'\x1d\x0a' or len(decoded) < 60:
+                    continue
 
-            # Skip the 28-byte session header to get to the AV payload
-            data = full_decoded[28:]
-            if data[0:4] != b'\x00\x70\x0b\x00':
-                continue
+                # Skip the 28-byte session header to get to the AV payload
+                data = decoded[28:]
+                if data[0:4] != b'\x00\x70\x0b\x00':
+                    continue
 
-            # io_type is at offset 28 into the AV payload
-            io_type = struct.unpack("<I", data[28:32])[0]
-            user_payload = data[32:]
+                # io_type is at offset 28 into the AV payload
+                io_type = struct.unpack("<I", data[28:32])[0]
+                user_payload = data[32:]
 
-            if expected_type == 0 or io_type == expected_type:
-                _LOGGER.debug(f"recv_ioctrl type=0x{io_type:04x} FOUND at idx {pkt_idx}")
-                return io_type, user_payload
-            else:
-                # Log status updates (0x1101) only occasionally to prevent logging flood
-                if pkt_idx % 50 == 0 or io_type != 0x1101:
-                    _LOGGER.debug(
-                        f"recv_ioctrl [{pkt_idx}] SKIP io=0x{io_type:04x} "
-                        f"(want 0x{expected_type:04x})"
-                    )
+                if expected_type == 0 or io_type == expected_type:
+                    # If msg_id verification is requested, check first 4 bytes of payload
+                    if expected_msg_id is not None and len(user_payload) >= 4:
+                        recv_msg_id = struct.unpack("<I", user_payload[:4])[0]
+                        if recv_msg_id != expected_msg_id:
+                            # Stale packet from a previous command flood
+                            # THROTTLED LOGGING: Only log every 50th stale packet during floods
+                            if pkt_idx % 50 == 0:
+                                _LOGGER.debug(
+                                    f"recv_ioctrl [{pkt_idx}] SKIP stale type=0x{io_type:04x} "
+                                    f"id={recv_msg_id} (want {expected_msg_id})"
+                                )
+                            continue
+
+                    _LOGGER.debug(f"recv_ioctrl type=0x{io_type:04x} FOUND at idx {pkt_idx}")
+                    # Send a single ACK for the packet we actually wanted
+                    recv_seq = struct.unpack('<H', decoded[6:8])[0]
+                    self.transport._send_session_ack(recv_seq)
+                    return io_type, user_payload
+                else:
+                    # Log unusual packets occasionally
+                    if pkt_idx % 100 == 0 or (io_type != 0x1101 and pkt_idx % 50 == 0):
+                        _LOGGER.debug(
+                            f"recv_ioctrl [{pkt_idx}] SKIP io=0x{io_type:04x} "
+                            f"(want 0x{expected_type:04x})"
+                        )
 
         raise TutkTimeoutError(
-            f"IOCtrl response timeout (expected 0x{expected_type:04x})"
+            f"IOCtrl response timeout after {pkt_idx} pkts (expected 0x{expected_type:04x})"
         )
 
 
@@ -959,94 +1025,125 @@ class TutkClient:
 
     def get_night_light_status(self) -> bool:
         """
-        Get the current night light status.
-
-        Sends IOType 0x1100 (GET_NIGHT_LIGHT_ON_OFF_REQ) with 8-byte
-        payload (timestamp + reserved).
-        Response IOType 0x1101 has 16 bytes: msg_id(4) + result(4) + on_off(4) + reserved(4).
+        Fetch the current status of the night light.
         """
         if not self.av_channel:
             return False
-        try:
-            # Pause keepalive to prevent traffic noise during command
-            self.av_channel._stop_keepalive()
-            # Drain the network buffer of old status streams
-            self.transport.drain()
+            
+        # OPTIMISTIC CACHING: If we just set the state recently, rely on that cache
+        # during the 'Long-Tail Flood' window (approx 15 seconds).
+        now = time.time()
+        if now - self.transport._last_set_time < 15.0:
+            _LOGGER.debug("Using optimistic nightlight state during flood window")
+            return self.transport._last_set_state
 
-            msg_id = self._get_msg_id()
+        try:
+            # Suppress background traffic during GET exchange
+            self.transport._keepalive_paused = True
+            
+            # Clear any stale status flood packets
+            self.transport.drain(max_duration=1.0)
+            
+            msg_id = int(time.time())
             payload = struct.pack("<ii", msg_id, 0x1a221a22)
+            
             self.av_channel.send_ioctrl(
                 IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_REQ, payload
             )
+            
             io_type, resp = self.av_channel.recv_ioctrl(
                 IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_RESP,
-                timeout=5.0
+                timeout=5.0,
+                expected_msg_id=msg_id
             )
-            _LOGGER.debug(f"GET resp ({len(resp)} bytes): {resp.hex()}")
+            
             if len(resp) >= 12:
                 resp_msg_id, result, on_off = struct.unpack("<iii", resp[:12])
                 _LOGGER.info(
-                    f"Night light: msg_id={resp_msg_id} result={result} "
-                    f"on_off={on_off}"
+                    f"Night light: msg_id={resp_msg_id} result={result} on_off={on_off}"
                 )
                 return on_off == 1
         except Exception as e:
             _LOGGER.error(f"Error getting nightlight: {e}")
         finally:
-            # Always restart keepalive
-            if self.av_channel:
-                self.av_channel._start_keepalive()
+            self.transport._keepalive_paused = False
         return False
 
     def set_night_light_status(self, state: bool) -> bool:
         """
         Set the night light on or off.
-
-        Sends IOType 0x1102 (SET_NIGHT_LIGHT_ON_OFF_REQ) with 12-byte
-        payload (msg_id + on_off + reserved).
         """
         if not self.av_channel:
             return False
+        
+        # Every command needs a unique message ID (epoch timestamp)
+        msg_id = int(time.time())
+        on_off = 1 if state else 0
+        payload = struct.pack("<iii", msg_id, on_off, 0)
+        
         try:
-            # Pause keepalive to prevent traffic noise during command
-            self.av_channel._stop_keepalive()
-            # Drain the network buffer
-            self.transport.drain()
-
-            on_off = 1 if state else 0
-            msg_id = self._get_msg_id()
-            payload = struct.pack("<iii", msg_id, on_off, 0)
-
+            # Silence background keepalives during SET attempt
+            self.transport._keepalive_paused = True
+            
             for attempt in range(1, 4):
                 _LOGGER.info(f"Setting night light to {'ON' if state else 'OFF'} (attempt {attempt})...")
+                
+                # Clear stale status packets before sending
+                self.transport.drain()
+                
                 self.av_channel.send_ioctrl(
                     IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_REQ, payload
                 )
-
+                
                 try:
-                    self.av_channel.recv_ioctrl(IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_RESP, timeout=3.0)
+                    # Wait for 0x1103 confirmation from THIS SPECIFIC message ID
+                    self.av_channel.recv_ioctrl(
+                        IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_RESP, 
+                        timeout=5.0,
+                        expected_msg_id=msg_id
+                    )
                     _LOGGER.info(f"SET confirmation (0x1103) received on attempt {attempt}")
-                    # Drain the 0x1103 flood that follows a state change
-                    # before allowing keepalive or GET to resume
-                    time.sleep(0.5)
-                    self.transport.drain()
+                    
+                    # Store optimistic state
+                    self.transport._last_set_time = time.time()
+                    self.transport._last_set_state = state
+                    
+                    # If we got the 0x1103, we are OPTIMISTIC. 
+                    # We briefly try a GET to update state, but don't fail if GET floods out.
+                    try:
+                        # Settling delay followed by simple draining
+                        time.sleep(1.0)
+                        self.transport.drain()
+                        
+                        # Generate a fresh msg_id for the verification GET
+                        v_msg_id = int(time.time())
+                        v_payload = struct.pack("<ii", v_msg_id, 0x1a221a22)
+                        
+                        self.av_channel.send_ioctrl(
+                            IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_REQ, v_payload
+                        )
+                        # Use a standard timeout for verification GET
+                        self.av_channel.recv_ioctrl(
+                            IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_RESP, 
+                            timeout=5.0,
+                            expected_msg_id=v_msg_id
+                        )
+                    except Exception:
+                        _LOGGER.debug("SET confirmed, but verification flood is still settling. Trusting cache.")
+                    
                     return True
                 except TutkTimeoutError:
                     if attempt < 3:
                         _LOGGER.warning(f"No SET response on attempt {attempt}, retrying...")
                         time.sleep(1.0)
-                        self.transport.drain()
                         continue
                     else:
                         _LOGGER.error("No SET response received after 3 attempts")
                         return False
-
         except Exception as e:
             _LOGGER.error(f"Error setting nightlight: {e}")
         finally:
-            # Always restart keepalive
-            if self.av_channel:
-                self.av_channel._start_keepalive()
+            self.transport._keepalive_paused = False
         return False
 
     def disconnect(self):

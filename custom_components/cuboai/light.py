@@ -130,6 +130,8 @@ class CuboNightLight(LightEntity):
                 except Exception as err:
                     _LOGGER.error("TUTK command failed: %s", err)
                     self._connected = False
+                    # On failure, we disconnect to ensure a fresh session next time.
+                    # This is safe because _async_run_tutk_cmd holds self._lock.
                     try:
                         self._client.disconnect()
                     except Exception:
@@ -138,10 +140,18 @@ class CuboNightLight(LightEntity):
 
             loop = asyncio.get_running_loop()
             # Hard cap at 30 s to accommodate discovery (10s) + handshake + auth
-            return await asyncio.wait_for(
-                loop.run_in_executor(None, _run),
-                timeout=30.0,
-            )
+            try:
+                return await asyncio.wait_for(
+                    loop.run_in_executor(None, _run),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                # If we timeout, we must ensure we don't leave the client in an 
+                # inconsistent state, but we don't disconnect() here because 
+                # the executor thread is still running _run().
+                # The next call to _async_run_tutk_cmd will wait on self._lock.
+                _LOGGER.warning("TUTK command timed out after 30s")
+                raise
 
     async def async_turn_on(self, **kwargs):
         """Instruct the light to turn on."""
