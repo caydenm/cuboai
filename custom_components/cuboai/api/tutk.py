@@ -566,12 +566,13 @@ class TutkTransport:
                 if not self.sock:
                     break
                 with self._recv_lock:
-                    remaining = timeout - (time.time() - start)
-                    # Use a zero timeout for the final check if time is up,
-                    # ensuring we catch any trailing packets.
-                    if remaining <= 0:
+                    # SLURP FIX: If timeout is 0, we must attempt a non-blocking read.
+                    if timeout == 0:
                         self.sock.settimeout(0.0)
                     else:
+                        remaining = timeout - (time.time() - start)
+                        if remaining <= 0:
+                            break
                         self.sock.settimeout(min(1.0, remaining))
                     
                     try:
@@ -898,10 +899,11 @@ class AVChannel:
 
             # SLURP MODE: Once we find data, process ALL available packets 
             # currently waiting in the OS kernel buffer in a single transaction.
-            # This drastically increases throughput during camera floods.
             batch_pkts = [res]
+            slurp_start = time.time()
             try:
-                for _ in range(200): # Process up to 200 packets in a single burst
+                # Limit slurp to 100ms per batch to prevent death loops
+                while time.time() - slurp_start < 0.1 and len(batch_pkts) < 500:
                     nxt = self.transport.recv_session_data(timeout=0.0, suppress_ack=True)
                     if not nxt:
                         break
@@ -1062,12 +1064,15 @@ class TutkClient:
                 _LOGGER.info(
                     f"Night light: msg_id={resp_msg_id} result={result} on_off={on_off}"
                 )
-                return on_off == 1
+                self.transport._last_set_state = (on_off == 1)
+                return self.transport._last_set_state
         except Exception as e:
             _LOGGER.error(f"Error getting nightlight: {e}")
         finally:
             self.transport._keepalive_paused = False
-        return False
+            
+        # Return last known good state if we failed to fetch it
+        return self.transport._last_set_state
 
     def set_night_light_status(self, state: bool) -> bool:
         """
