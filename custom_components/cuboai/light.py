@@ -108,8 +108,28 @@ class CuboNightLight(LightEntity):
         try:
             if not self._client.connect(ip=self._ip_address):
                 raise TutkError("connect() returned False")
+            
             self._connected = True
             self._last_connect_failure = 0.0
+            
+            # IP PERSISTENCE: If we found a new IP via discovery, save it to persistent storage
+            # so we can skip discovery on the next Home Assistant restart.
+            new_ip = self._client.transport.device_ip
+            if new_ip and new_ip != self._ip_address:
+                _LOGGER.info("Updating last known IP for %s: %s", self._baby_name, new_ip)
+                self._ip_address = new_ip
+                
+                # Update the ConfigEntry data so it survives HA restarts
+                current_data = dict(self.platform.config_entry.data)
+                cameras = list(current_data.get("cameras", []))
+                for camera in cameras:
+                    if camera.get("device_id") == self._uid:
+                        camera["ip_address"] = new_ip
+                        break
+                
+                self.hass.config_entries.async_update_entry(
+                    self.platform.config_entry, data=current_data
+                )
         except Exception:
             self._connected = False
             self._last_connect_failure = time.monotonic()

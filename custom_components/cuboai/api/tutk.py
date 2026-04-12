@@ -164,11 +164,19 @@ class TutkTransport:
                     sock.settimeout(max(0.1, min(1.0, timeout - (time.time() - start))))
                     data, addr = sock.recvfrom(2048)
                     recv_count += 1
+                    
+                    # Log all potential responses at INFO during discovery for debugging
                     res = self._parse_lan_search_response(data)
                     if res:
                         found_uid, punch_out = res
-                        _LOGGER.info(f"Discovered device {found_uid} at {addr[0]}:{addr[1]}")
-                        return (addr[0], addr[1], punch_out)
+                        if found_uid == uid:
+                            _LOGGER.info(f"Discovered TARGET device {found_uid} at {addr[0]}:{addr[1]}")
+                            return (addr[0], addr[1], punch_out)
+                        else:
+                            _LOGGER.info(
+                                f"Discovery: Found OTHER device {found_uid} at {addr[0]}:{addr[1]} "
+                                f"(does not match requested {uid})"
+                            )
                     else:
                         # Log non-matching packets to help debug
                         decoded = self._deobfuscate(data)
@@ -325,9 +333,9 @@ class TutkTransport:
                 targets.append((f"{prefix}.{host}", TUTK_LAN_SEARCH_PORT))
 
         _LOGGER.info(
-            f"Discovery: scanning {len(scanned_prefixes)} subnet(s): "
+            f"Discovery: Scanning {len(scanned_prefixes)} subnet(s) for camera: "
             f"{', '.join(sorted(scanned_prefixes))} "
-            f"({len(targets)} targets)"
+            f"(Total {len(targets)} address/port targets)"
         )
         return targets
 
@@ -529,9 +537,10 @@ class TutkTransport:
         with self._lock:
             self.sock.sendto(frame, (self.device_ip, self.device_port))
         return 0
-    def drain(self, max_duration: float = 1.0, silence_timeout: float = 0.2):
+    def drain(self, max_duration: float = 1.0, silence_timeout: float = 0.05):
         """
         Drain pending packets until silence is detected or max_duration reached.
+        Optimized for 0ms exit if buffer is empty.
         """
         if not self.sock:
             return
@@ -541,17 +550,22 @@ class TutkTransport:
         try:
             with self._recv_lock:
                 orig_timeout = self.sock.gettimeout()
+                
+                # Check once non-blocking to exit instantly if empty
+                self.sock.settimeout(0.0)
+                try:
+                    self.sock.recvfrom(4096)
+                    count += 1
+                except (BlockingIOError, socket.timeout):
+                    return # Exit immediately if nothing to drain
+                
+                # If we found something, continue draining with a tiny silence window
                 while time.time() - start < max_duration:
                     try:
-                        # Wait for a short burst of silence
                         self.sock.settimeout(silence_timeout)
                         self.sock.recvfrom(4096)
                         count += 1
-                        # If we got a packet, we reduce the silence window for the next one
-                        # to keep things moving fast.
-                        silence_timeout = min(silence_timeout, 0.05)
                     except (BlockingIOError, socket.timeout):
-                        # Silence detected!
                         break
                 self.sock.settimeout(orig_timeout)
         except Exception as e:
@@ -970,6 +984,7 @@ class TutkClient:
         self.admin_pwd = admin_pwd
         self.transport: TutkTransport = TutkTransport()
         self.av_channel: Optional[AVChannel] = None
+        self._command_lock = threading.Lock()
 
     def connect(self, timeout: float = 10.0, ip: Optional[str] = None) -> bool:
         """Discover device on LAN (or use direct IP), establish session, authenticate."""
@@ -1032,7 +1047,8 @@ class TutkClient:
         if not self.av_channel:
             return False
             
-        # OPTIMISTIC CACHING: If we just set the state recently, rely on that cache
+        with self._command_lock:
+            # OPTIMISTIC CACHING: If we just set the state recently, rely on that cache
         # during the 'Long-Tail Flood' window (approx 15 seconds).
         now = time.time()
         if now - self.transport._last_set_time < 15.0:
@@ -1081,74 +1097,75 @@ class TutkClient:
         if not self.av_channel:
             return False
         
-        # Every command needs a unique message ID (epoch timestamp)
-        msg_id = int(time.time())
-        on_off = 1 if state else 0
-        payload = struct.pack("<iii", msg_id, on_off, 0)
-        
-        try:
-            # Silence background keepalives during SET attempt
-            self.transport._keepalive_paused = True
+        with self._command_lock:
+            # Every command needs a unique message ID (epoch timestamp)
+            msg_id = int(time.time())
+            on_off = 1 if state else 0
+            payload = struct.pack("<iii", msg_id, on_off, 0)
             
-            for attempt in range(1, 4):
-                _LOGGER.info(f"Setting night light to {'ON' if state else 'OFF'} (attempt {attempt})...")
+            try:
+                # Silence background keepalives during SET attempt
+                self.transport._keepalive_paused = True
                 
-                # Clear stale status packets before sending
-                self.transport.drain()
-                
-                self.av_channel.send_ioctrl(
-                    IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_REQ, payload
-                )
-                
-                try:
-                    # Wait for 0x1103 confirmation from THIS SPECIFIC message ID
-                    self.av_channel.recv_ioctrl(
-                        IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_RESP, 
-                        timeout=5.0,
-                        expected_msg_id=msg_id
+                for attempt in range(1, 4):
+                    _LOGGER.info(f"Setting night light to {'ON' if state else 'OFF'} (attempt {attempt})...")
+                    
+                    # Clear stale status packets before sending
+                    self.transport.drain()
+                    
+                    self.av_channel.send_ioctrl(
+                        IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_REQ, payload
                     )
-                    _LOGGER.info(f"SET confirmation (0x1103) received on attempt {attempt}")
                     
-                    # Store optimistic state
-                    self.transport._last_set_time = time.time()
-                    self.transport._last_set_state = state
-                    
-                    # If we got the 0x1103, we are OPTIMISTIC. 
-                    # We briefly try a GET to update state, but don't fail if GET floods out.
                     try:
-                        # Settling delay followed by simple draining
-                        time.sleep(1.0)
-                        self.transport.drain()
-                        
-                        # Generate a fresh msg_id for the verification GET
-                        v_msg_id = int(time.time())
-                        v_payload = struct.pack("<ii", v_msg_id, 0x1a221a22)
-                        
-                        self.av_channel.send_ioctrl(
-                            IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_REQ, v_payload
-                        )
-                        # Use a standard timeout for verification GET
+                        # Wait for 0x1103 confirmation from THIS SPECIFIC message ID
                         self.av_channel.recv_ioctrl(
-                            IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_RESP, 
+                            IOTYPE_USER_SET_NIGHT_LIGHT_ON_OFF_RESP, 
                             timeout=5.0,
-                            expected_msg_id=v_msg_id
+                            expected_msg_id=msg_id
                         )
-                    except Exception:
-                        _LOGGER.debug("SET confirmed, but verification flood is still settling. Trusting cache.")
-                    
-                    return True
-                except TutkTimeoutError:
-                    if attempt < 3:
-                        _LOGGER.warning(f"No SET response on attempt {attempt}, retrying...")
-                        time.sleep(1.0)
-                        continue
-                    else:
-                        _LOGGER.error("No SET response received after 3 attempts")
-                        return False
-        except Exception as e:
-            _LOGGER.error(f"Error setting nightlight: {e}")
-        finally:
-            self.transport._keepalive_paused = False
+                        _LOGGER.info(f"SET confirmation (0x1103) received on attempt {attempt}")
+                        
+                        # Store optimistic state
+                        self.transport._last_set_time = time.time()
+                        self.transport._last_set_state = state
+                        
+                        # If we got the 0x1103, we are OPTIMISTIC. 
+                        # We briefly try a GET to update state, but don't fail if GET floods out.
+                        try:
+                            # Settling delay followed by simple draining
+                            time.sleep(1.0)
+                            self.transport.drain()
+                            
+                            # Generate a fresh msg_id for the verification GET
+                            v_msg_id = int(time.time())
+                            v_payload = struct.pack("<ii", v_msg_id, 0x1a221a22)
+                            
+                            self.av_channel.send_ioctrl(
+                                IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_REQ, v_payload
+                            )
+                            # Use a standard timeout for verification GET
+                            self.av_channel.recv_ioctrl(
+                                IOTYPE_USER_GET_NIGHT_LIGHT_ON_OFF_RESP, 
+                                timeout=5.0,
+                                expected_msg_id=v_msg_id
+                            )
+                        except Exception:
+                            _LOGGER.debug("SET confirmed, but verification flood is still settling. Trusting cache.")
+                        
+                        return True
+                    except TutkTimeoutError:
+                        if attempt < 3:
+                            _LOGGER.warning(f"No SET response on attempt {attempt}, retrying...")
+                            time.sleep(1.0)
+                            continue
+                        else:
+                            _LOGGER.error("No SET response received after 3 attempts")
+                            return False
+            except Exception as e:
+                _LOGGER.error(f"Error setting nightlight: {e}")
+            finally:
+                self.transport._keepalive_paused = False
         return False
 
     def disconnect(self):
