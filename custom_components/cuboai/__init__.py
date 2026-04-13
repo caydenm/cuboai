@@ -20,6 +20,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Ensure token paths are set (in case async_setup wasn't called)
     set_token_paths(hass.config.path())
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = entry
+
+    # Pre-import platforms to prevent blocking the event loop
+    for platform in PLATFORMS:
+        await hass.async_add_executor_job(
+            __import__, f"custom_components.{DOMAIN}.{platform}"
+        )
+
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
