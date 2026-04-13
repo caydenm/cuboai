@@ -28,7 +28,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
         # P2P requires the admin credentials extracted from the cloud API
         if uid and user and pwd and license_id:
-            entities.append(CuboNightLight(hass, baby_name, uid, license_id, user, pwd, camera))
+            entities.append(CuboNightLight(hass, entry, baby_name, uid, license_id, user, pwd, camera))
         else:
             _LOGGER.warning(
                 "Skipping nightlight for %s because admin credentials or license_id are missing. "
@@ -54,9 +54,10 @@ class CuboNightLight(LightEntity):
     _attr_supported_color_modes = {ColorMode.ONOFF}
     _attr_should_poll = False  # Do NOT poll — connect only on toggle
 
-    def __init__(self, hass, baby_name, uid, license_id, dev_admin_id, dev_admin_pwd, camera_data):
+    def __init__(self, hass, entry, baby_name, uid, license_id, dev_admin_id, dev_admin_pwd, camera_data):
         """Initialize the light."""
         self.hass = hass
+        self._entry = entry
         self._baby_name = baby_name
         self._uid = uid
         self._license_id = license_id
@@ -120,7 +121,7 @@ class CuboNightLight(LightEntity):
                 self._ip_address = new_ip
                 
                 # Update the ConfigEntry data so it survives HA restarts
-                current_data = dict(self.platform.config_entry.data)
+                current_data = dict(self._entry.data)
                 cameras = list(current_data.get("cameras", []))
                 for camera in cameras:
                     if camera.get("device_id") == self._uid:
@@ -128,7 +129,7 @@ class CuboNightLight(LightEntity):
                         break
                 
                 self.hass.config_entries.async_update_entry(
-                    self.platform.config_entry, data=current_data
+                    self._entry, data=current_data
                 )
         except Exception:
             self._connected = False
